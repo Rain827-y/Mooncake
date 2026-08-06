@@ -50,6 +50,13 @@ if(USE_ASCEND_DIRECT)
                         PUBLIC ascendcl transfer_engine)
 endif()
 
+if(USE_ASCEND OR USE_ASCEND_DIRECT)
+  add_executable(ascend_host_buffer_probe
+                 ${WORKSPACE}/ascend_host_buffer_probe.cpp)
+  target_link_libraries(ascend_host_buffer_probe
+                        PUBLIC ascendcl transfer_engine)
+endif()
+
 if(USE_ASCEND_HETEROGENEOUS)
   add_executable(
     transfer_engine_heterogeneous_ascend_perf_initiator
