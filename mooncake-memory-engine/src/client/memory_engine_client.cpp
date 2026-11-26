@@ -53,7 +53,6 @@ struct ClientOptions {
 struct RemoteRegion {
     size_t size{};
     bool mapped{};
-    bool revoked{};
 };
 
 struct PeerMapping {
@@ -61,7 +60,9 @@ struct PeerMapping {
     uint64_t generation{};
     bool revoked{};
     std::string segmentName;
-    std::map<uint64_t, RemoteRegion> regions;
+    std::unordered_map<uint64_t, RemoteRegion> regions;
+    std::unordered_set<uint64_t> revokedRegions;
+    size_t liveRegions{};
 };
 
 enum class RegionState { Pending, Published, Revoking, Retired };
@@ -181,21 +182,21 @@ struct MemoryEngine::Impl {
     Status SharePeer(const json &payload);
     Status SharePeers(const json &payload);
     Status UnsharePeer(const json &payload);
-    Status OpenSharedPeer(const std::string &id, const SharedPeer &request);
+    Status OpenSharedPeer(const std::string &id, uint32_t rank, uint64_t generation, const std::string &segment);
     Status ValidatePeerRequest(const std::string &id, uint32_t rank) const;
     Status MapPeerRegion(uint32_t rank, PeerMapping &peer, const GvaRegion &region);
     Status UpdatePeerRegion(const json &payload, PeerRegionAction action);
     Status RevokePeerRegion(uint32_t rank, PeerMapping &peer, const GvaRegion &region);
-    Status DrainPeerMappings(const PeerMapping &peer);
+    Status DrainPeerMappings(PeerMapping &peer);
     Status ClosePeer(PeerMapping &peer);
-    void RemoveRemoteCopyRegion(SegmentID segment, uint64_t address);
+    bool RemoveRemoteCopyRegion(SegmentID segment, uint64_t address);
     Status DestroyTent();
     Status AllocateLocal(size_t size, MemoryEngineMemType type, GvaRegion &region);
     Status SendRegionUpdateToServer(const GvaRegion &region, RegionUpdateAction action);
     Status ReleaseLocal(uint64_t address, LocalRegion &local, bool releaseMemory);
     Status ReconcileAllocation();
     Status RetireLocal(uint64_t address, LocalRegion &local);
-    Status DrainRetired(uint64_t requested);
+    Status DrainRetired(std::optional<uint64_t> requested = std::nullopt);
     Status ReleaseMembership();
     Status CancelRegistration();
 
@@ -363,19 +364,22 @@ Status MemoryEngine::Impl::ValidatePeerRequest(const std::string &id, uint32_t r
     return Status::OK();
 }
 
-Status MemoryEngine::Impl::DrainPeerMappings(const PeerMapping &peer)
+Status MemoryEngine::Impl::DrainPeerMappings(PeerMapping &peer)
 {
     Status result;
     for (const auto &[address, region] : peer.regions) {
         const auto status = mTent->unmapRemoteMemory(peer.segment, reinterpret_cast<void *>(address), MEMFABRIC);
-        // A successful unmap means the MemFabric rank has been cleaned.
+        // MemFabric cleans the rank after its last active slice is unmapped.
         if (status.ok()) {
-            return status;
+            result = status;
+            break;
         }
-        // An attempt that failed before native import has no mapping to clear.
         if (!status.IsInvalidArgument() || region.mapped) {
             result = status;
         }
+    }
+    if (result.ok()) {
+        peer.regions.clear();
     }
     return result;
 }
@@ -383,54 +387,65 @@ Status MemoryEngine::Impl::DrainPeerMappings(const PeerMapping &peer)
 Status MemoryEngine::Impl::ClosePeer(PeerMapping &peer)
 {
     if (peer.segment != LOCAL_SEGMENT_ID) {
+        peer.revoked = true;
         for (const auto &entry : peer.regions) {
-            RemoveRemoteCopyRegion(peer.segment, entry.first);
+            if (RemoveRemoteCopyRegion(peer.segment, entry.first)) {
+                --peer.liveRegions;
+            }
         }
         CHECK_STATUS(DrainPeerMappings(peer));
         CHECK_STATUS(mTent->closeSegment(peer.segment));
         peer.segment = LOCAL_SEGMENT_ID;
     }
-    peer.regions.clear();
+    peer.revokedRegions.clear();
     peer.segmentName.clear();
     return Status::OK();
 }
 
-void MemoryEngine::Impl::RemoveRemoteCopyRegion(SegmentID segment, uint64_t address)
+bool MemoryEngine::Impl::RemoveRemoteCopyRegion(SegmentID segment, uint64_t address)
 {
     const auto found = mRemoteCopyRegions.find(address);
-    if (found != mRemoteCopyRegions.end() && found->second.segment == segment) {
-        mRemoteCopyRegions.erase(found);
+    if (found == mRemoteCopyRegions.end() || found->second.segment != segment) {
+        return false;
     }
+    mRemoteCopyRegions.erase(found);
+    return true;
 }
 
-Status MemoryEngine::Impl::OpenSharedPeer(const std::string &id, const SharedPeer &request)
+Status MemoryEngine::Impl::OpenSharedPeer(const std::string &id, uint32_t rank, uint64_t generation,
+                                         const std::string &segment)
 {
-    CHECK_STATUS(ValidatePeerRequest(id, request.rank));
-    if (!mTent || request.segment == mTent->getSegmentName()) [[unlikely]] {
+    CHECK_STATUS(ValidatePeerRequest(id, rank));
+    if (!mTent || segment == mTent->getSegmentName()) [[unlikely]] {
         return Status::InvalidEntry("Invalid MemoryEngine peer segment");
     }
-    auto &peer = mPeers[request.rank];
-    if (peer.generation > request.generation || (peer.generation == request.generation && peer.revoked)) [[unlikely]] {
+    auto &peer = mPeers[rank];
+    if (peer.generation > generation || (peer.generation == generation && peer.revoked)) [[unlikely]] {
         return Status::InvalidEntry("MemoryEngine peer generation was replaced or revoked");
     }
-    if (peer.generation < request.generation) {
+    if (peer.generation < generation) {
         CHECK_STATUS(ClosePeer(peer));
-        peer.generation = request.generation;
+        peer.generation = generation;
         peer.revoked = false;
     }
     if (peer.segment != LOCAL_SEGMENT_ID) {
-        return peer.segmentName == request.segment ? Status::OK() :
+        return peer.segmentName == segment ? Status::OK() :
             Status::InvalidEntry("MemoryEngine peer changed its segment");
     }
-    CHECK_STATUS(mTent->openSegment(peer.segment, request.segment));
-    peer.segmentName = request.segment;
+    CHECK_STATUS(mTent->openSegment(peer.segment, segment));
+    peer.segmentName = segment;
     return Status::OK();
 }
 
 Status MemoryEngine::Impl::MapPeerRegion(uint32_t rank, PeerMapping &peer, const GvaRegion &region)
 {
+    if (peer.revokedRegions.contains(region.address)) [[unlikely]] {
+        LOG(ERROR) << "MemoryEngine peer region was revoked, registration ID:" << mId
+                   << ", rank:" << mRank << ", peer rank:" << rank << ", bytes:" << region.size << ".";
+        return Status::InvalidEntry("MemoryEngine peer region was revoked");
+    }
     auto &mapped = peer.regions.try_emplace(region.address, RemoteRegion{region.size}).first->second;
-    if (mapped.revoked || mapped.size != region.size) [[unlikely]] {
+    if (mapped.size != region.size) [[unlikely]] {
         LOG(ERROR) << "MemoryEngine peer region conflicts with existing record, registration ID:" << mId
                    << ", rank:" << mRank << ", peer rank:" << rank << ", bytes:" << region.size << ".";
         return Status::InvalidEntry("MemoryEngine peer region conflicts with existing record");
@@ -445,6 +460,7 @@ Status MemoryEngine::Impl::MapPeerRegion(uint32_t rank, PeerMapping &peer, const
                    << ", rank:" << mRank << ", peer rank:" << rank << ", bytes:" << region.size << ".";
         return Status::InvalidEntry("MemoryEngine remote GVA routing would be ambiguous");
     }
+    // The default transport selection refreshes metadata when the region is missing from the cache.
     const auto status = mTent->mapRemoteMemory(peer.segment, reinterpret_cast<void *>(region.address), region.size);
     if (!status.ok()) [[unlikely]] {
         LOG(ERROR) << "Failed to map MemoryEngine peer region, registration ID:" << mId << ", rank:" << mRank
@@ -453,28 +469,25 @@ Status MemoryEngine::Impl::MapPeerRegion(uint32_t rank, PeerMapping &peer, const
         return status;
     }
     mapped.mapped = true;
+    ++peer.liveRegions;
     mRemoteCopyRegions.emplace(region.address, RemoteCopyRegion{region.size, peer.segment});
     return Status::OK();
 }
 
 Status MemoryEngine::Impl::RevokePeerRegion(uint32_t rank, PeerMapping &peer, const GvaRegion &region)
 {
-    auto &mapped = peer.regions.try_emplace(region.address, RemoteRegion{region.size}).first->second;
-    if (mapped.size != region.size) [[unlikely]] {
+    const auto found = peer.regions.find(region.address);
+    if (found != peer.regions.end() && found->second.size != region.size) [[unlikely]] {
         LOG(ERROR) << "MemoryEngine UnmapRegion size mismatch, registration ID:" << mId << ", rank:" << mRank
                    << ", peer rank:" << rank << ", requested bytes:" << region.size
-                   << ", mapped bytes:" << mapped.size << ".";
+                   << ", mapped bytes:" << found->second.size << ".";
         return Status::InvalidArgument("Conflicting MemoryEngine region size");
     }
-    mapped.revoked = true;
-    RemoveRemoteCopyRegion(peer.segment, region.address);
-    const bool live = std::any_of(peer.regions.begin(), peer.regions.end(), [](const auto &entry) {
-        return entry.second.mapped && !entry.second.revoked;
-    });
-    if (live) {
-        return Status::OK();
+    peer.revokedRegions.insert(region.address);
+    if (RemoveRemoteCopyRegion(peer.segment, region.address)) {
+        --peer.liveRegions;
     }
-    return DrainPeerMappings(peer);
+    return peer.liveRegions ? Status::OK() : DrainPeerMappings(peer);
 }
 
 Status MemoryEngine::Impl::UpdatePeerRegion(const json &payload, PeerRegionAction action)
@@ -496,12 +509,10 @@ Status MemoryEngine::Impl::UpdatePeerRegion(const json &payload, PeerRegionActio
 
 Status MemoryEngine::Impl::SharePeer(const json &payload)
 {
-    PeerRequest header;
-    CHECK_STATUS(DecodePeerRequest(payload, header));
-    SharedPeer request{header.rank, header.generation, {}, {}};
-    CHECK_STATUS(DecodeSharePeerDetails(payload, request));
+    SharePeerRequest request;
+    CHECK_STATUS(DecodeSharePeerRequest(payload, request));
     std::lock_guard lock(mPeerMutex);
-    return OpenSharedPeer(header.id, request);
+    return OpenSharedPeer(request.peer.id, request.peer.rank, request.peer.generation, request.segment);
 }
 
 Status MemoryEngine::Impl::SharePeers(const json &payload)
@@ -510,9 +521,7 @@ Status MemoryEngine::Impl::SharePeers(const json &payload)
     CHECK_STATUS(DecodeSharePeersRequest(payload, mLayout.worldSize, request));
     std::lock_guard lock(mPeerMutex);
     for (const auto &shared : request.peers) {
-        CHECK_STATUS(OpenSharedPeer(request.id, shared));
-    }
-    for (const auto &shared : request.peers) {
+        CHECK_STATUS(OpenSharedPeer(request.id, shared.rank, shared.generation, shared.segment));
         auto &peer = mPeers.at(shared.rank);
         for (const auto &region : shared.regions) {
             CHECK_STATUS(MapPeerRegion(shared.rank, peer, region));
@@ -679,7 +688,7 @@ Status MemoryEngine::Impl::Allocate(size_t size, MemoryEngineMemType type, void 
     }
     const auto aligned = ((size - 1) / ALLOCATION_ALIGNMENT + 1) * ALLOCATION_ALIGNMENT;
     CHECK_STATUS(ReconcileAllocation());
-    CHECK_STATUS(DrainRetired(0));
+    CHECK_STATUS(DrainRetired());
 
     GvaRegion region;
     CHECK_STATUS(AllocateLocal(aligned, type, region));
@@ -702,7 +711,7 @@ Status MemoryEngine::Impl::Allocate(size_t size, MemoryEngineMemType type, void 
     return Status::OK();
 }
 
-Status MemoryEngine::Impl::DrainRetired(uint64_t requested)
+Status MemoryEngine::Impl::DrainRetired(std::optional<uint64_t> requested)
 {
     // HYBM unmaps an imported rank as a unit. Its revoked slices can still
     // have native mappings until peers revoke the last live slice.
@@ -717,7 +726,7 @@ Status MemoryEngine::Impl::DrainRetired(uint64_t requested)
             mLocalRegions.erase(local);
             it = mRetired.erase(it);
         } else {
-            if (*it == requested) {
+            if (!requested || *it == *requested) {
                 result = status;
             }
             ++it;
@@ -803,7 +812,7 @@ MemoryEngineCopyResult MemoryEngine::Impl::PlanCopy(const MemoryEngineCopyEntry 
 }
 
 Status MemoryEngine::Impl::FinishCopyBatch(BatchID batch, const Status &submitted,
-                                         std::vector<TransferStatus> &statuses)
+                                          std::vector<TransferStatus> &statuses)
 {
     auto wait = mTent->waitTransfer(batch, &statuses, static_cast<uint64_t>(mBatchCopyTimeout.count()));
     const bool pending = std::any_of(statuses.begin(), statuses.end(), [](const auto &task) {
@@ -816,7 +825,11 @@ Status MemoryEngine::Impl::FinishCopyBatch(BatchID batch, const Status &submitte
         if (!drain.ok()) [[unlikely]] {
             LOG(ERROR) << "Failed to drain MemoryEngine copy batch, registration ID:" << mId << ", rank:" << mRank
                        << ", status:" << static_cast<uint16_t>(drain.code()) << ".";
-            wait = drain;
+            if (wait.ok()) {
+                wait = drain;
+            }
+        } else if (!wait.ok()) {
+            statuses = std::move(drained);
         }
     }
     const auto released = mTent->freeBatch(batch);
@@ -844,13 +857,12 @@ Status MemoryEngine::Impl::BatchCopy(const std::vector<MemoryEngineCopyEntry> &e
 
     std::unique_lock peerLock(mPeerMutex);
     for (size_t index = 0; index < entries.size(); ++index) {
-        const auto result = PlanCopy(entries[index], requests);
+        auto result = PlanCopy(entries[index], requests);
         if (result == MemoryEngineCopyResult::Ok) {
             indices.push_back(index);
-            results[index] = static_cast<int32_t>(MemoryEngineCopyResult::InvalidArgument);
-        } else {
-            results[index] = static_cast<int32_t>(result);
+            result = MemoryEngineCopyResult::TransferFailed;
         }
+        results[index] = static_cast<int32_t>(result);
     }
     if (requests.empty()) {
         return Status::OK();
@@ -865,6 +877,10 @@ Status MemoryEngine::Impl::BatchCopy(const std::vector<MemoryEngineCopyEntry> &e
 
     std::vector<TransferStatus> statuses;
     const auto status = FinishCopyBatch(batch, submitted, statuses);
+    const auto reported = std::min(statuses.size(), indices.size());
+    for (size_t i = 0; i < reported; ++i) {
+        results[indices[i]] = static_cast<int32_t>(CopyResult(statuses[i].s));
+    }
     if (!status.ok()) [[unlikely]] {
         LOG(ERROR) << "MemoryEngine copy batch failed, registration ID:" << mId << ", rank:" << mRank
                    << ", requests:" << requests.size() << ", status:" << static_cast<uint16_t>(status.code()) << ".";
@@ -872,9 +888,6 @@ Status MemoryEngine::Impl::BatchCopy(const std::vector<MemoryEngineCopyEntry> &e
     }
     if (statuses.size() != indices.size()) [[unlikely]] {
         return Status::InternalError("MemoryEngine copy batch returned an invalid status count");
-    }
-    for (size_t i = 0; i < indices.size(); ++i) {
-        results[indices[i]] = static_cast<int32_t>(CopyResult(statuses[i].s));
     }
     return Status::OK();
 }
@@ -891,7 +904,6 @@ Status MemoryEngine::Impl::DestroyTent()
         }
     }
     mPeers.clear();
-    mRemoteCopyRegions.clear();
     for (auto it = mLocalRegions.begin(); it != mLocalRegions.end();) {
         CHECK_STATUS(ReleaseLocal(it->first, it->second, true));
         it = mLocalRegions.erase(it);

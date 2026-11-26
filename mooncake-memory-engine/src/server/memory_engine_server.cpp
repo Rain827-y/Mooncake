@@ -179,16 +179,14 @@ Status SendToPeersInParallel(MemoryEngineRpc &rpc, MemoryRpc op, const std::vect
     return Status::OK();
 }
 
-SharedPeer BuildSharedPeer(const Registration &target, const Registration &owner, bool includeRegions)
+SharedPeer BuildSharedPeer(const Registration &target, const Registration &owner)
 {
     SharedPeer peer{owner.rank, std::max(target.generation, owner.generation), owner.segment, {}};
-    if (includeRegions) {
-        peer.regions.reserve(owner.regions.size());
-        for (const auto &entry : owner.regions) {
-            const auto &region = entry.second;
-            if (!region.revoking) {
-                peer.regions.push_back(region);
-            }
+    peer.regions.reserve(owner.regions.size());
+    for (const auto &entry : owner.regions) {
+        const auto &region = entry.second;
+        if (!region.revoking) {
+            peer.regions.push_back(region);
         }
     }
     return peer;
@@ -640,7 +638,8 @@ Status MemoryEngineServer::Impl::SharePeersForJoin(const Registration &member, c
     std::vector<PeerCallback> calls;
     calls.reserve(peers.size());
     for (const auto &peer : peers) {
-        auto request = EncodeSharePeerRequest({peer.id, BuildSharedPeer(peer, member, false)});
+        const auto generation = std::max(peer.generation, member.generation);
+        auto request = EncodeSharePeerRequest({{peer.id, member.rank, generation}, member.segment});
         calls.push_back({{peer.callback, std::move(request)}, peer.rank, member.rank});
     }
 
@@ -662,7 +661,7 @@ Status MemoryEngineServer::Impl::SendPeersInfoToJoiner(const Registration &membe
         SharePeersRequest request{member.id, {}};
         request.peers.reserve(peers.size());
         for (const auto &peer : peers) {
-            request.peers.push_back(BuildSharedPeer(member, peer, true));
+            request.peers.push_back(BuildSharedPeer(member, peer));
         }
         call.request = EncodeSharePeersRequest(request);
     }

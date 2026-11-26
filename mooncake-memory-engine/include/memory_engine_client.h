@@ -45,6 +45,7 @@ class MemoryEngine {
     Status Allocate(size_t size, MemoryEngineMemType type, void **address);
     // Stop direct access on all participants before freeing the region.
     Status Free(void *address);
+    // Each entry connects a published local GVA and a mapped peer GVA.
     // Entries must be independent and buffers must remain valid through completion.
     Status BatchCopy(const std::vector<MemoryEngineCopyEntry> &entries, std::vector<int32_t> *results);
 

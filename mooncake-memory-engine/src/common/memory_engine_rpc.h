@@ -15,7 +15,6 @@
 #ifndef MOONCAKE_MEMORY_ENGINE_RPC_H
 #define MOONCAKE_MEMORY_ENGINE_RPC_H
 
-#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -95,8 +94,6 @@ class MemoryEngineRpc {
 
     std::mutex mHandlerMutex;
     std::unordered_map<int, Handler> mHandlers;
-
-    std::atomic<bool> mRunning{false};
 };
 
 }

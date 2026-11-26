@@ -126,7 +126,7 @@ Status MemoryEngineRpc::Start(uint16_t& port, bool ipv6, size_t threads) {
     const static uint16_t kStartPort = 15000;
     const static uint16_t kPortRange = 2000;
     const static int kMaxRetry = 10;
-    if (mRunning) {
+    if (mServer) {
         return Status::InvalidArgument("RPC server already started" LOC_MARK);
     }
     easylog::set_min_severity(easylog::Severity::FATAL);
@@ -147,7 +147,7 @@ Status MemoryEngineRpc::Start(uint16_t& port, bool ipv6, size_t threads) {
 
 Status MemoryEngineRpc::StartAt(const std::string &host, uint16_t port, size_t threads)
 {
-    if (mRunning) {
+    if (mServer) {
         return Status::InvalidArgument("RPC server already started" LOC_MARK);
     }
     easylog::set_min_severity(easylog::Severity::FATAL);
@@ -166,7 +166,6 @@ Status MemoryEngineRpc::StartListener(const std::string &host, uint16_t port, si
             return Status::RpcServiceError("Failed to bind RPC listener");
         }
         mServer = server.release();
-        mRunning = true;
         return Status::OK();
     } catch (const std::exception &) {
         LOG(WARNING) << "Failed to start RPC server on port " << port << ".";

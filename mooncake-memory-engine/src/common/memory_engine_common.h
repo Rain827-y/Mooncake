@@ -150,8 +150,8 @@ struct SharedPeer {
 };
 
 struct SharePeerRequest {
-    std::string id;
-    SharedPeer peer;
+    PeerRequest peer;
+    std::string segment;
 };
 
 struct SharePeersRequest {
@@ -205,7 +205,7 @@ json EncodePeerRequest(const PeerRequest &request);
 Status DecodePeerRequest(const json &payload, PeerRequest &request);
 
 json EncodeSharePeerRequest(const SharePeerRequest &request);
-Status DecodeSharePeerDetails(const json &payload, SharedPeer &peer);
+Status DecodeSharePeerRequest(const json &payload, SharePeerRequest &request);
 
 json EncodeSharePeersRequest(const SharePeersRequest &request);
 Status DecodeSharePeersRequest(const json &payload, uint32_t worldSize, SharePeersRequest &request);
