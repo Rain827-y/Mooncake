@@ -14,6 +14,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 #include <glog/logging.h>
@@ -28,6 +29,7 @@ namespace tent {
 namespace {
 
 constexpr auto DEFAULT_HEARTBEAT = Milliseconds(3000);
+constexpr size_t ALLOCATION_ALIGNMENT = 2UL << 20;
 constexpr int REGISTRATION_ID_WORDS = 4;
 #ifdef USE_MEMFABRIC
 constexpr char TENT_METADATA_TYPE[] = "metadata_type";
@@ -56,6 +58,14 @@ struct PeerMapping {
     bool revoked{};
     std::string segmentName;
     std::map<uint64_t, RemoteRegion> regions;
+};
+
+enum class RegionState { Pending, Published, Revoking, Retired };
+
+struct LocalRegion {
+    size_t size{};
+    bool registered{};
+    RegionState state{RegionState::Pending};
 };
 
 Status ReadClientOptions(const Config &config, ClientOptions &options)
@@ -119,15 +129,23 @@ struct MemoryEngine::Impl {
     void StartHeartbeat(Milliseconds interval);
     Status Join();
     Status Leave();
+    Status Allocate(size_t size, MemoryEngineMemType type, void **address);
     Status SharePeer(const json &payload);
     Status SharePeers(const json &payload);
     Status UnsharePeer(const json &payload);
     Status OpenSharedPeer(const std::string &id, const SharedPeer &request);
     Status ValidatePeerRequest(const std::string &id, uint32_t rank) const;
     Status MapPeerRegion(uint32_t rank, PeerMapping &peer, const GvaRegion &region);
+    Status UpdatePeerRegion(const json &payload, PeerRegionAction action);
+    Status RevokePeerRegion(uint32_t rank, PeerMapping &peer, const GvaRegion &region);
     Status DrainPeerMappings(const PeerMapping &peer);
     Status ClosePeer(PeerMapping &peer);
-    Status ClearPeers();
+    Status DestroyTent();
+    Status AllocateLocal(size_t size, MemoryEngineMemType type, GvaRegion &region);
+    Status SendRegionUpdateToServer(const GvaRegion &region, RegionUpdateAction action);
+    Status ReleaseLocal(uint64_t address, LocalRegion &local, bool releaseMemory);
+    Status ReconcileAllocation();
+    Status DrainRetired(uint64_t requested);
     Status ReleaseMembership();
     Status CancelRegistration();
 
@@ -147,6 +165,10 @@ struct MemoryEngine::Impl {
     Milliseconds mJoinTimeout{DEFAULT_REGISTRATION};
     Milliseconds mHeartbeatInterval{DEFAULT_HEARTBEAT};
     std::unordered_map<uint32_t, PeerMapping> mPeers;
+    std::map<uint64_t, LocalRegion> mLocalRegions;
+    std::unordered_set<uint64_t> mRetired;
+    std::optional<uint64_t> mFailedAllocation;
+    size_t mLiveRegions{};
     MemoryEngineRpc mRpc;
     std::unique_ptr<TransferEngine> mTent;
     std::jthread mHeartbeat;
@@ -188,6 +210,12 @@ Status MemoryEngine::Impl::StartCallbacks(std::string host)
                                  [this](const json &request, json &) { return SharePeers(request); }, true));
     CHECK_STATUS(RegisterHandler(mRpc, MemoryRpc::UnsharePeer,
                                  [this](const json &request, json &) { return UnsharePeer(request); }, true));
+    CHECK_STATUS(RegisterHandler(mRpc, MemoryRpc::MapRegion, [this](const json &request, json &) {
+        return UpdatePeerRegion(request, PeerRegionAction::Map);
+    }, true));
+    CHECK_STATUS(RegisterHandler(mRpc, MemoryRpc::UnmapRegion, [this](const json &request, json &) {
+        return UpdatePeerRegion(request, PeerRegionAction::Unmap);
+    }, true));
     uint16_t port{};
     CHECK_STATUS(mRpc.Start(port, ipv6));
     mCallbackAddress = buildIpAddrWithPort(host, port, ipv6);
@@ -358,6 +386,42 @@ Status MemoryEngine::Impl::MapPeerRegion(uint32_t rank, PeerMapping &peer, const
     return Status::OK();
 }
 
+Status MemoryEngine::Impl::RevokePeerRegion(uint32_t rank, PeerMapping &peer, const GvaRegion &region)
+{
+    auto &mapped = peer.regions.try_emplace(region.address, RemoteRegion{region.size}).first->second;
+    if (mapped.size != region.size) [[unlikely]] {
+        LOG(ERROR) << "MemoryEngine UnmapRegion size mismatch, registration ID:" << mId << ", rank:" << mRank
+                   << ", peer rank:" << rank << ", requested bytes:" << region.size
+                   << ", mapped bytes:" << mapped.size << ".";
+        return Status::InvalidArgument("Conflicting MemoryEngine region size");
+    }
+    mapped.revoked = true;
+    const bool live = std::any_of(peer.regions.begin(), peer.regions.end(), [](const auto &entry) {
+        return entry.second.mapped && !entry.second.revoked;
+    });
+    if (live) {
+        return Status::OK();
+    }
+    return DrainPeerMappings(peer);
+}
+
+Status MemoryEngine::Impl::UpdatePeerRegion(const json &payload, PeerRegionAction action)
+{
+    PeerRegionRequest request;
+    CHECK_STATUS(DecodePeerRegion(payload, request));
+    std::lock_guard lock(mPeerMutex);
+    const auto rank = request.peer.rank;
+    CHECK_STATUS(ValidatePeerRequest(request.peer.id, rank));
+    const auto found = mPeers.find(rank);
+    const bool map = action == PeerRegionAction::Map;
+    if (!mTent || found == mPeers.end() || found->second.revoked ||
+        found->second.generation != request.peer.generation) {
+        return map ? Status::InvalidEntry("MemoryEngine peer relationship is not current") : Status::OK();
+    }
+    return map ? MapPeerRegion(rank, found->second, request.region) :
+        RevokePeerRegion(rank, found->second, request.region);
+}
+
 Status MemoryEngine::Impl::SharePeer(const json &payload)
 {
     PeerRequest header;
@@ -433,7 +497,164 @@ Status MemoryEngine::Impl::Leave()
     return ReleaseMembership();
 }
 
-Status MemoryEngine::Impl::ClearPeers()
+Status MemoryEngine::Impl::AllocateLocal(size_t size, MemoryEngineMemType type, GvaRegion &region)
+{
+    MemoryOptions options;
+    options.location = type == MemoryEngineMemType::Host ? "cpu" : "npu";
+    void *memory = nullptr;
+    options.type = MEMFABRIC;
+    auto status = mTent->allocateLocalMemory(&memory, size, options);
+    if (!status.ok()) {
+        LOG(ERROR) << "MemoryEngine local allocation failed, registration ID:" << mId << ", rank:" << mRank
+                   << ", location:" << options.location << ", bytes:" << size
+                   << ", status:" << static_cast<uint16_t>(status.code()) << ".";
+        return status;
+    }
+
+    region.address = reinterpret_cast<uint64_t>(memory);
+    region.size = size;
+    auto &local = mLocalRegions.try_emplace(region.address, LocalRegion{size}).first->second;
+    // Registration can have published metadata before reporting an error.
+    local.registered = true;
+    status = mTent->registerLocalMemory(memory, size, options);
+    if (!status.ok()) [[unlikely]] {
+        LOG(ERROR) << "Failed to register MemoryEngine region, registration ID:" << mId
+                   << ", rank:" << mRank << ", bytes:" << size
+                   << ", status:" << static_cast<uint16_t>(status.code()) << ".";
+        if (ReleaseLocal(region.address, local, true).ok()) {
+            mLocalRegions.erase(region.address);
+        } else {
+            mFailedAllocation = region.address;
+        }
+    }
+    return status;
+}
+
+Status MemoryEngine::Impl::SendRegionUpdateToServer(const GvaRegion &region, RegionUpdateAction action)
+{
+    const auto op = action == RegionUpdateAction::Publish ? MemoryRpc::PublishRegion : MemoryRpc::RevokeRegion;
+    const RegionRequest request{mId, region};
+    const PeerCall server{mServer, EncodeRegionRequest(request)};
+    const auto status = CallControl(mRpc, op, server, Clock::now() + mJoinTimeout + RPC_TIMEOUT);
+    if (!status.ok()) {
+        LOG(ERROR) << "MemoryEngine region update failed, registration ID:" << mId << ", rank:" << mRank
+                   << ", bytes:" << request.region.size << ", status:" << static_cast<uint16_t>(status.code()) << ".";
+    }
+    return status;
+}
+
+Status MemoryEngine::Impl::ReleaseLocal(uint64_t address, LocalRegion &local, bool releaseMemory)
+{
+    auto *memory = reinterpret_cast<void *>(address);
+    if (local.registered) {
+        const auto unregisterRet = mTent->unregisterLocalMemory(memory, local.size);
+        if (!unregisterRet.ok()) [[unlikely]] {
+            LOG(ERROR) << "Failed to unregister MemoryEngine allocation, registration ID:" << mId << ", rank:" << mRank
+                       << ", bytes:" << local.size << ", status:" << static_cast<uint16_t>(unregisterRet.code()) << ".";
+            return unregisterRet;
+        }
+        local.registered = false;
+    }
+
+    if (releaseMemory) {
+        const auto freeRet = mTent->freeLocalMemory(memory);
+        if (!freeRet.ok()) [[unlikely]] {
+            LOG(ERROR) << "Failed to free MemoryEngine allocation, registration ID:" << mId << ", rank:" << mRank
+                       << ", bytes:" << local.size << ", status:" << static_cast<uint16_t>(freeRet.code()) << ".";
+        }
+        return freeRet;
+    }
+    return Status::OK();
+}
+
+Status MemoryEngine::Impl::ReconcileAllocation()
+{
+    if (!mFailedAllocation) {
+        return Status::OK();
+    }
+    auto &local = mLocalRegions.at(*mFailedAllocation);
+    const bool exported = local.state == RegionState::Revoking;
+    if (exported) {
+        CHECK_STATUS(SendRegionUpdateToServer({*mFailedAllocation, local.size}, RegionUpdateAction::Revoke));
+    }
+    const bool release = !exported || !mLiveRegions;
+    CHECK_STATUS(ReleaseLocal(*mFailedAllocation, local, release));
+    if (release) {
+        mLocalRegions.erase(*mFailedAllocation);
+    } else {
+        local.state = RegionState::Retired;
+        mRetired.insert(*mFailedAllocation);
+    }
+    mFailedAllocation.reset();
+    return Status::OK();
+}
+
+Status MemoryEngine::Impl::Allocate(size_t size, MemoryEngineMemType type, void **address)
+{
+    std::lock_guard lock(mApiMutex);
+    if (!mJoined) {
+        return Status::InvalidEntry("Join MemoryEngine before allocating");
+    }
+    if (!address || !size || (type != MemoryEngineMemType::Host && type != MemoryEngineMemType::Device)) {
+        return Status::InvalidArgument("Invalid MemoryEngine allocation request");
+    }
+    const auto window = type == MemoryEngineMemType::Host ? mLayout.hostWindow : mLayout.deviceWindow;
+    if (size > window) {
+        LOG(WARNING) << "MemoryEngine allocation exceeds the rank window, registration ID:" << mId
+                     << ", rank:" << mRank << ", location:" << (type == MemoryEngineMemType::Host ? "cpu" : "npu")
+                     << ", bytes:" << size << ", window bytes:" << window << ".";
+        return Status::TooManyRequests("MemoryEngine allocation exceeds the rank window");
+    }
+    const auto aligned = ((size - 1) / ALLOCATION_ALIGNMENT + 1) * ALLOCATION_ALIGNMENT;
+    CHECK_STATUS(ReconcileAllocation());
+    CHECK_STATUS(DrainRetired(0));
+
+    GvaRegion region;
+    CHECK_STATUS(AllocateLocal(aligned, type, region));
+    const auto allocated = region.address;
+    const auto status = SendRegionUpdateToServer(region, RegionUpdateAction::Publish);
+    auto &local = mLocalRegions.at(allocated);
+    if (!status.ok()) {
+        local.state = RegionState::Revoking;
+        mFailedAllocation = allocated;
+        const auto cleanup = ReconcileAllocation();
+        if (!cleanup.ok()) {
+            LOG(ERROR) << "Failed to roll back MemoryEngine allocation, registration ID:" << mId << ", rank:" << mRank
+                       << ", bytes:" << aligned << ", status:" << static_cast<uint16_t>(cleanup.code()) << ".";
+        }
+        return status;
+    }
+    local.state = RegionState::Published;
+    ++mLiveRegions;
+    *address = reinterpret_cast<void *>(allocated);
+    return Status::OK();
+}
+
+Status MemoryEngine::Impl::DrainRetired(uint64_t requested)
+{
+    // HYBM unmaps an imported rank as a unit. Its revoked slices can still
+    // have native mappings until peers revoke the last live slice.
+    if (mLiveRegions || mFailedAllocation) {
+        return Status::OK();
+    }
+    Status result;
+    for (auto it = mRetired.begin(); it != mRetired.end();) {
+        auto local = mLocalRegions.find(*it);
+        auto status = ReleaseLocal(local->first, local->second, true);
+        if (status.ok()) {
+            mLocalRegions.erase(local);
+            it = mRetired.erase(it);
+        } else {
+            if (*it == requested) {
+                result = status;
+            }
+            ++it;
+        }
+    }
+    return result;
+}
+
+Status MemoryEngine::Impl::DestroyTent()
 {
     std::lock_guard lock(mPeerMutex);
     for (auto &[rank, peer] : mPeers) {
@@ -445,6 +666,13 @@ Status MemoryEngine::Impl::ClearPeers()
         }
     }
     mPeers.clear();
+    for (auto it = mLocalRegions.begin(); it != mLocalRegions.end();) {
+        CHECK_STATUS(ReleaseLocal(it->first, it->second, true));
+        it = mLocalRegions.erase(it);
+    }
+    mRetired.clear();
+    mFailedAllocation.reset();
+    mLiveRegions = 0;
     mTent.reset();
     return Status::OK();
 }
@@ -460,7 +688,7 @@ Status MemoryEngine::Impl::ReleaseMembership()
                    << ", status:" << static_cast<uint16_t>(begin.code()) << ".";
         return begin;
     }
-    CHECK_STATUS(ClearPeers());
+    CHECK_STATUS(DestroyTent());
     const auto finish = CallAsync(mRpc, MemoryRpc::FinishLeave, server, Clock::now() + RPC_TIMEOUT).get();
     if (!finish.ok()) [[unlikely]] {
         LOG(ERROR) << "MemoryEngine FinishLeave failed, registration ID:" << mId << ", rank:" << mRank
@@ -532,7 +760,7 @@ Status MemoryEngine::Impl::InitializeRegistration()
     CHECK_STATUS(CancelRegistration());
     const auto status = ConfirmRegistration();
     if (!status.ok()) [[unlikely]] {
-        auto cleanup = ClearPeers();
+        auto cleanup = DestroyTent();
         if (cleanup.ok()) {
             cleanup = CancelRegistration();
         }
@@ -601,6 +829,11 @@ Status MemoryEngine::Join()
 Status MemoryEngine::Leave()
 {
     return mImpl->Leave();
+}
+
+Status MemoryEngine::Allocate(size_t size, MemoryEngineMemType type, void **address)
+{
+    return mImpl->Allocate(size, type, address);
 }
 
 }

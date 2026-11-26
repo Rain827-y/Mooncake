@@ -158,6 +158,13 @@ struct SharePeersRequest {
     std::vector<SharedPeer> peers;
 };
 
+enum class PeerRegionAction { Map, Unmap };
+
+struct PeerRegionRequest {
+    PeerRequest peer;
+    GvaRegion region;
+};
+
 struct PeerCall {
     std::string endpoint;
     json request;
@@ -190,6 +197,7 @@ Status DecodeCancelRequest(const json &payload, CancelRequest &request);
 json EncodeJoinRequest(const JoinRequest &request);
 Status DecodeJoinRequest(const json &payload, JoinRequest &request);
 
+json EncodeRegionRequest(const RegionRequest &request);
 Status DecodeRegionRequest(const json &payload, RegionRequest &request);
 
 json EncodePeerRequest(const PeerRequest &request);
@@ -202,6 +210,7 @@ json EncodeSharePeersRequest(const SharePeersRequest &request);
 Status DecodeSharePeersRequest(const json &payload, uint32_t worldSize, SharePeersRequest &request);
 
 json EncodePeerRegionRequest(const PeerRequest &peer, const GvaRegion &region);
+Status DecodePeerRegion(const json &payload, PeerRegionRequest &request);
 
 std::string EncodeReply(const Status &status, json &response);
 

@@ -4,6 +4,7 @@
 #ifndef TENT_MEMORY_ENGINE_CLIENT_H
 #define TENT_MEMORY_ENGINE_CLIENT_H
 
+#include <cstddef>
 #include <memory>
 
 #include "tent/common/status.h"
@@ -12,6 +13,8 @@ namespace mooncake {
 namespace tent {
 
 class Config;
+
+enum class MemoryEngineMemType { Host, Device };
 
 class MemoryEngine {
    public:
@@ -23,6 +26,7 @@ class MemoryEngine {
     Status Join();
     // Quiesce any direct access to GVA before leaving.
     Status Leave();
+    Status Allocate(size_t size, MemoryEngineMemType type, void **address);
 
    private:
     struct Impl;

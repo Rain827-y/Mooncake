@@ -322,6 +322,13 @@ Status DecodeJoinRequest(const json &payload, JoinRequest &request)
     return Status::OK();
 }
 
+json EncodeRegionRequest(const RegionRequest &request)
+{
+    json payload{{ID_KEY, request.id}};
+    EncodeRegion(request.region, payload);
+    return payload;
+}
+
 Status DecodeRegionRequest(const json &payload, RegionRequest &request)
 {
     GvaRegion region;
@@ -414,6 +421,12 @@ json EncodePeerRegionRequest(const PeerRequest &peer, const GvaRegion &region)
     auto payload = EncodePeerRequest(peer);
     EncodeRegion(region, payload);
     return payload;
+}
+
+Status DecodePeerRegion(const json &payload, PeerRegionRequest &request)
+{
+    CHECK_STATUS(DecodePeerRequest(payload, request.peer));
+    return ReadRegion(payload, request.region) ? Status::OK() : Status::InvalidArgument("Invalid MemoryEngine region");
 }
 
 std::string EncodeReply(const Status &status, json &response)
