@@ -4,12 +4,15 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <new>
 #include <optional>
 #include <random>
+#include <shared_mutex>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -29,6 +32,7 @@ namespace tent {
 namespace {
 
 constexpr auto DEFAULT_HEARTBEAT = Milliseconds(3000);
+constexpr auto DEFAULT_BATCH_COPY_TIMEOUT = Milliseconds(30000);
 constexpr size_t ALLOCATION_ALIGNMENT = 2UL << 20;
 constexpr int REGISTRATION_ID_WORDS = 4;
 #ifdef USE_MEMFABRIC
@@ -67,6 +71,45 @@ struct LocalRegion {
     bool registered{};
     RegionState state{RegionState::Pending};
 };
+
+struct RemoteCopyRegion {
+    size_t size{};
+    SegmentID segment{};
+};
+
+struct CopyEndpoint {
+    SegmentID segment{LOCAL_SEGMENT_ID};
+    bool localGva{};
+    bool valid{true};
+};
+
+template <typename Region>
+const std::pair<const uint64_t, Region> *FindCopyRegion(const std::map<uint64_t, Region> &regions, uint64_t address)
+{
+    const auto next = regions.upper_bound(address);
+    if (next == regions.begin()) {
+        return nullptr;
+    }
+    const auto range = std::prev(next);
+    return address - range->first < range->second.size ? &*range : nullptr;
+}
+
+MemoryEngineCopyResult CopyResult(TransferStatusEnum status)
+{
+    switch (status) {
+        case COMPLETED:
+            return MemoryEngineCopyResult::Ok;
+        case INITIAL:
+        case PENDING:
+        case CANCELED:
+        case TIMEOUT:
+            return MemoryEngineCopyResult::TimedOut;
+        case INVALID:
+            return MemoryEngineCopyResult::InvalidArgument;
+        default:
+            return MemoryEngineCopyResult::TransferFailed;
+    }
+}
 
 Status ReadClientOptions(const Config &config, ClientOptions &options)
 {
@@ -131,6 +174,10 @@ struct MemoryEngine::Impl {
     Status Leave();
     Status Allocate(size_t size, MemoryEngineMemType type, void **address);
     Status Free(void *address);
+    Status BatchCopy(const std::vector<MemoryEngineCopyEntry> &entries, std::vector<int32_t> &results);
+    CopyEndpoint ResolveCopyEndpoint(uint64_t address, size_t size) const;
+    MemoryEngineCopyResult PlanCopy(const MemoryEngineCopyEntry &entry, std::vector<Request> &requests) const;
+    Status FinishCopyBatch(BatchID batch, const Status &submitted, std::vector<TransferStatus> &statuses);
     Status SharePeer(const json &payload);
     Status SharePeers(const json &payload);
     Status UnsharePeer(const json &payload);
@@ -141,6 +188,7 @@ struct MemoryEngine::Impl {
     Status RevokePeerRegion(uint32_t rank, PeerMapping &peer, const GvaRegion &region);
     Status DrainPeerMappings(const PeerMapping &peer);
     Status ClosePeer(PeerMapping &peer);
+    void RemoveRemoteCopyRegion(SegmentID segment, uint64_t address);
     Status DestroyTent();
     Status AllocateLocal(size_t size, MemoryEngineMemType type, GvaRegion &region);
     Status SendRegionUpdateToServer(const GvaRegion &region, RegionUpdateAction action);
@@ -151,7 +199,7 @@ struct MemoryEngine::Impl {
     Status ReleaseMembership();
     Status CancelRegistration();
 
-    std::mutex mApiMutex;
+    std::shared_mutex mApiMutex;
     std::mutex mPeerMutex;
     std::shared_ptr<const Config> mConfig;
     Layout mLayout;
@@ -166,7 +214,9 @@ struct MemoryEngine::Impl {
     bool mLeaving{};
     Milliseconds mJoinTimeout{DEFAULT_REGISTRATION};
     Milliseconds mHeartbeatInterval{DEFAULT_HEARTBEAT};
+    Milliseconds mBatchCopyTimeout{DEFAULT_BATCH_COPY_TIMEOUT};
     std::unordered_map<uint32_t, PeerMapping> mPeers;
+    std::map<uint64_t, RemoteCopyRegion> mRemoteCopyRegions;
     std::map<uint64_t, LocalRegion> mLocalRegions;
     std::unordered_set<uint64_t> mRetired;
     std::optional<uint64_t> mFailedAllocation;
@@ -333,6 +383,9 @@ Status MemoryEngine::Impl::DrainPeerMappings(const PeerMapping &peer)
 Status MemoryEngine::Impl::ClosePeer(PeerMapping &peer)
 {
     if (peer.segment != LOCAL_SEGMENT_ID) {
+        for (const auto &entry : peer.regions) {
+            RemoveRemoteCopyRegion(peer.segment, entry.first);
+        }
         CHECK_STATUS(DrainPeerMappings(peer));
         CHECK_STATUS(mTent->closeSegment(peer.segment));
         peer.segment = LOCAL_SEGMENT_ID;
@@ -340,6 +393,14 @@ Status MemoryEngine::Impl::ClosePeer(PeerMapping &peer)
     peer.regions.clear();
     peer.segmentName.clear();
     return Status::OK();
+}
+
+void MemoryEngine::Impl::RemoveRemoteCopyRegion(SegmentID segment, uint64_t address)
+{
+    const auto found = mRemoteCopyRegions.find(address);
+    if (found != mRemoteCopyRegions.end() && found->second.segment == segment) {
+        mRemoteCopyRegions.erase(found);
+    }
 }
 
 Status MemoryEngine::Impl::OpenSharedPeer(const std::string &id, const SharedPeer &request)
@@ -377,6 +438,13 @@ Status MemoryEngine::Impl::MapPeerRegion(uint32_t rank, PeerMapping &peer, const
     if (mapped.mapped) {
         return Status::OK();
     }
+    const auto next = mRemoteCopyRegions.lower_bound(region.address);
+    if ((next != mRemoteCopyRegions.end() && next->first - region.address < region.size) ||
+        FindCopyRegion(mRemoteCopyRegions, region.address)) [[unlikely]] {
+        LOG(ERROR) << "MemoryEngine remote region overlaps a mapped region, registration ID:" << mId
+                   << ", rank:" << mRank << ", peer rank:" << rank << ", bytes:" << region.size << ".";
+        return Status::InvalidEntry("MemoryEngine remote GVA routing would be ambiguous");
+    }
     const auto status = mTent->mapRemoteMemory(peer.segment, reinterpret_cast<void *>(region.address), region.size);
     if (!status.ok()) [[unlikely]] {
         LOG(ERROR) << "Failed to map MemoryEngine peer region, registration ID:" << mId << ", rank:" << mRank
@@ -385,6 +453,7 @@ Status MemoryEngine::Impl::MapPeerRegion(uint32_t rank, PeerMapping &peer, const
         return status;
     }
     mapped.mapped = true;
+    mRemoteCopyRegions.emplace(region.address, RemoteCopyRegion{region.size, peer.segment});
     return Status::OK();
 }
 
@@ -398,6 +467,7 @@ Status MemoryEngine::Impl::RevokePeerRegion(uint32_t rank, PeerMapping &peer, co
         return Status::InvalidArgument("Conflicting MemoryEngine region size");
     }
     mapped.revoked = true;
+    RemoveRemoteCopyRegion(peer.segment, region.address);
     const bool live = std::any_of(peer.regions.begin(), peer.regions.end(), [](const auto &entry) {
         return entry.second.mapped && !entry.second.revoked;
     });
@@ -687,6 +757,128 @@ Status MemoryEngine::Impl::Free(void *address)
     return DrainRetired(key);
 }
 
+CopyEndpoint MemoryEngine::Impl::ResolveCopyEndpoint(uint64_t address, size_t size) const
+{
+    if (const auto *local = FindCopyRegion(mLocalRegions, address)) {
+        const auto fits = size <= local->second.size - (address - local->first);
+        return {LOCAL_SEGMENT_ID, true, fits && local->second.state == RegionState::Published};
+    }
+    if (const auto *remote = FindCopyRegion(mRemoteCopyRegions, address)) {
+        const auto fits = size <= remote->second.size - (address - remote->first);
+        return {remote->second.segment, false, fits};
+    }
+    return {};
+}
+
+MemoryEngineCopyResult MemoryEngine::Impl::PlanCopy(const MemoryEngineCopyEntry &entry,
+                                                   std::vector<Request> &requests) const
+{
+    const auto sourceAddress = reinterpret_cast<uint64_t>(entry.src);
+    const auto targetAddress = reinterpret_cast<uint64_t>(entry.dst);
+    if (!entry.src || !entry.dst || !entry.size || entry.size > std::numeric_limits<size_t>::max() ||
+        entry.size > UINT64_MAX - std::max(sourceAddress, targetAddress)) [[unlikely]] {
+        return MemoryEngineCopyResult::InvalidArgument;
+    }
+    const auto size = static_cast<size_t>(entry.size);
+    const auto source = ResolveCopyEndpoint(sourceAddress, size);
+    const auto target = ResolveCopyEndpoint(targetAddress, size);
+    if (!source.valid || !target.valid) [[unlikely]] {
+        return MemoryEngineCopyResult::InvalidArgument;
+    }
+
+    const bool write = source.localGva && target.segment != LOCAL_SEGMENT_ID;
+    const bool read = target.localGva && source.segment != LOCAL_SEGMENT_ID;
+    if (!read && !write) {
+        return MemoryEngineCopyResult::Unsupported;
+    }
+    Request request{};
+    request.opcode = write ? Request::WRITE : Request::READ;
+    request.source = write ? const_cast<void *>(entry.src) : entry.dst;
+    request.target_id = write ? target.segment : source.segment;
+    request.target_offset = write ? targetAddress : sourceAddress;
+    request.length = size;
+    request.transport_hint = MEMFABRIC;
+    requests.push_back(request);
+    return MemoryEngineCopyResult::Ok;
+}
+
+Status MemoryEngine::Impl::FinishCopyBatch(BatchID batch, const Status &submitted,
+                                         std::vector<TransferStatus> &statuses)
+{
+    auto wait = mTent->waitTransfer(batch, &statuses, static_cast<uint64_t>(mBatchCopyTimeout.count()));
+    const bool pending = std::any_of(statuses.begin(), statuses.end(), [](const auto &task) {
+        return task.s == PENDING || task.s == INITIAL;
+    });
+    // Preserve timeout results and wait for accepted work to stop using the buffers.
+    if (!wait.ok() || pending) {
+        std::vector<TransferStatus> drained;
+        const auto drain = mTent->waitTransfer(batch, &drained);
+        if (!drain.ok()) [[unlikely]] {
+            LOG(ERROR) << "Failed to drain MemoryEngine copy batch, registration ID:" << mId << ", rank:" << mRank
+                       << ", status:" << static_cast<uint16_t>(drain.code()) << ".";
+            wait = drain;
+        }
+    }
+    const auto released = mTent->freeBatch(batch);
+    if (!released.ok()) [[unlikely]] {
+        LOG(ERROR) << "Failed to release MemoryEngine copy batch, registration ID:" << mId << ", rank:" << mRank
+                   << ", status:" << static_cast<uint16_t>(released.code()) << ".";
+    }
+    if (!submitted.ok()) {
+        return submitted;
+    }
+    return wait.ok() ? released : wait;
+}
+
+Status MemoryEngine::Impl::BatchCopy(const std::vector<MemoryEngineCopyEntry> &entries, std::vector<int32_t> &results)
+{
+    std::shared_lock apiLock(mApiMutex);
+    if (!mJoined) {
+        return Status::InvalidEntry("Join MemoryEngine before copying");
+    }
+    results.resize(entries.size());
+    std::vector<Request> requests;
+    std::vector<size_t> indices;
+    requests.reserve(entries.size());
+    indices.reserve(entries.size());
+
+    std::unique_lock peerLock(mPeerMutex);
+    for (size_t index = 0; index < entries.size(); ++index) {
+        const auto result = PlanCopy(entries[index], requests);
+        if (result == MemoryEngineCopyResult::Ok) {
+            indices.push_back(index);
+            results[index] = static_cast<int32_t>(MemoryEngineCopyResult::InvalidArgument);
+        } else {
+            results[index] = static_cast<int32_t>(result);
+        }
+    }
+    if (requests.empty()) {
+        return Status::OK();
+    }
+
+    const auto batch = mTent->allocateBatch(requests.size());
+    if (!batch) [[unlikely]] {
+        return Status::InternalError("Could not allocate MemoryEngine copy batch");
+    }
+    const auto submitted = mTent->submitTransfer(batch, requests);
+    peerLock.unlock();
+
+    std::vector<TransferStatus> statuses;
+    const auto status = FinishCopyBatch(batch, submitted, statuses);
+    if (!status.ok()) [[unlikely]] {
+        LOG(ERROR) << "MemoryEngine copy batch failed, registration ID:" << mId << ", rank:" << mRank
+                   << ", requests:" << requests.size() << ", status:" << static_cast<uint16_t>(status.code()) << ".";
+        return status;
+    }
+    if (statuses.size() != indices.size()) [[unlikely]] {
+        return Status::InternalError("MemoryEngine copy batch returned an invalid status count");
+    }
+    for (size_t i = 0; i < indices.size(); ++i) {
+        results[indices[i]] = static_cast<int32_t>(CopyResult(statuses[i].s));
+    }
+    return Status::OK();
+}
+
 Status MemoryEngine::Impl::DestroyTent()
 {
     std::lock_guard lock(mPeerMutex);
@@ -699,6 +891,7 @@ Status MemoryEngine::Impl::DestroyTent()
         }
     }
     mPeers.clear();
+    mRemoteCopyRegions.clear();
     for (auto it = mLocalRegions.begin(); it != mLocalRegions.end();) {
         CHECK_STATUS(ReleaseLocal(it->first, it->second, true));
         it = mLocalRegions.erase(it);
@@ -777,6 +970,12 @@ Status MemoryEngine::Impl::Start(std::shared_ptr<const Config> config)
     if (mJoinTimeout <= Milliseconds::zero() || mJoinTimeout >= MAX_TIMEOUT) {
         LOG(ERROR) << "Invalid MemoryEngine join timeout, milliseconds:" << mJoinTimeout.count() << ".";
         return Status::InvalidArgument("Invalid MemoryEngine join timeout");
+    }
+    mBatchCopyTimeout = Milliseconds(config->get(config_keys::CONFIG_BATCH_COPY_TIMEOUT_MS,
+                                                DEFAULT_BATCH_COPY_TIMEOUT.count()));
+    if (mBatchCopyTimeout < Milliseconds::zero() || mBatchCopyTimeout >= MAX_TIMEOUT) {
+        LOG(ERROR) << "Invalid MemoryEngine batch copy timeout, milliseconds:" << mBatchCopyTimeout.count() << ".";
+        return Status::InvalidArgument("Invalid MemoryEngine batch copy timeout");
     }
     mConfig = std::move(config);
     mLayout = options.layout;
@@ -872,6 +1071,14 @@ Status MemoryEngine::Allocate(size_t size, MemoryEngineMemType type, void **addr
 Status MemoryEngine::Free(void *address)
 {
     return mImpl->Free(address);
+}
+
+Status MemoryEngine::BatchCopy(const std::vector<MemoryEngineCopyEntry> &entries, std::vector<int32_t> *results)
+{
+    if (!results || entries.empty() || entries.size() > UINT32_MAX) [[unlikely]] {
+        return Status::InvalidArgument("Invalid MemoryEngine copy batch");
+    }
+    return mImpl->BatchCopy(entries, *results);
 }
 
 }
