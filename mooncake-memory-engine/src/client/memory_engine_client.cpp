@@ -130,6 +130,7 @@ struct MemoryEngine::Impl {
     Status Join();
     Status Leave();
     Status Allocate(size_t size, MemoryEngineMemType type, void **address);
+    Status Free(void *address);
     Status SharePeer(const json &payload);
     Status SharePeers(const json &payload);
     Status UnsharePeer(const json &payload);
@@ -145,6 +146,7 @@ struct MemoryEngine::Impl {
     Status SendRegionUpdateToServer(const GvaRegion &region, RegionUpdateAction action);
     Status ReleaseLocal(uint64_t address, LocalRegion &local, bool releaseMemory);
     Status ReconcileAllocation();
+    Status RetireLocal(uint64_t address, LocalRegion &local);
     Status DrainRetired(uint64_t requested);
     Status ReleaseMembership();
     Status CancelRegistration();
@@ -654,6 +656,37 @@ Status MemoryEngine::Impl::DrainRetired(uint64_t requested)
     return result;
 }
 
+Status MemoryEngine::Impl::RetireLocal(uint64_t address, LocalRegion &local)
+{
+    local.state = RegionState::Revoking;
+    CHECK_STATUS(SendRegionUpdateToServer({address, local.size}, RegionUpdateAction::Revoke));
+    CHECK_STATUS(ReleaseLocal(address, local, false));
+    local.state = RegionState::Retired;
+    mRetired.insert(address);
+    --mLiveRegions;
+    return Status::OK();
+}
+
+Status MemoryEngine::Impl::Free(void *address)
+{
+    std::lock_guard lock(mApiMutex);
+    if (!mJoined) {
+        return Status::InvalidEntry("Join MemoryEngine before freeing");
+    }
+    const auto key = reinterpret_cast<uint64_t>(address);
+    const auto found = mLocalRegions.find(key);
+    if (found == mLocalRegions.end() || mFailedAllocation == key) [[unlikely]] {
+        LOG(WARNING) << "MemoryEngine Free rejected an allocation, registration ID:" << mId << ", rank:" << mRank
+                     << ", reason:" << (found == mLocalRegions.end() ? "base not owned" : "rollback pending") << ".";
+        return Status::InvalidArgument("MemoryEngine requires an owned allocation base");
+    }
+    auto &local = found->second;
+    if (local.state != RegionState::Retired) {
+        CHECK_STATUS(RetireLocal(key, local));
+    }
+    return DrainRetired(key);
+}
+
 Status MemoryEngine::Impl::DestroyTent()
 {
     std::lock_guard lock(mPeerMutex);
@@ -834,6 +867,11 @@ Status MemoryEngine::Leave()
 Status MemoryEngine::Allocate(size_t size, MemoryEngineMemType type, void **address)
 {
     return mImpl->Allocate(size, type, address);
+}
+
+Status MemoryEngine::Free(void *address)
+{
+    return mImpl->Free(address);
 }
 
 }
