@@ -20,6 +20,8 @@ class MemoryEngine {
     static Status Create(std::unique_ptr<MemoryEngine> *engine);
     ~MemoryEngine();
 
+    Status Join();
+
    private:
     struct Impl;
     explicit MemoryEngine(std::unique_ptr<Impl> impl);

@@ -8,6 +8,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <unordered_set>
 #include <utility>
 
 #include <glog/logging.h>
@@ -81,6 +82,18 @@ bool ReadRegion(const json &payload, GvaRegion &region)
     }
     region = {*address, static_cast<size_t>(*size)};
     return true;
+}
+
+Status DecodePeerRankAndGeneration(const json &payload, uint32_t &rank, uint64_t &generation)
+{
+    const auto decodedRank = ReadUnsigned(payload.at(RANK_KEY), MAX_RANKS);
+    const auto decodedGeneration = ReadUnsigned(payload.at(GENERATION_KEY), UINT64_MAX);
+    if (!decodedRank || !decodedGeneration || !*decodedGeneration) {
+        return Status::InvalidArgument("Invalid MemoryEngine peer callback");
+    }
+    rank = static_cast<uint32_t>(*decodedRank);
+    generation = *decodedGeneration;
+    return Status::OK();
 }
 
 json EncodeSharedPeer(const SharedPeer &peer)
@@ -294,6 +307,11 @@ Status DecodeCancelRequest(const json &payload, CancelRequest &request)
     return Status::OK();
 }
 
+json EncodeJoinRequest(const JoinRequest &request)
+{
+    return {{ID_KEY, request.id}, {SEGMENT_KEY, request.segment}};
+}
+
 Status DecodeJoinRequest(const json &payload, JoinRequest &request)
 {
     JoinRequest decoded{payload.at(ID_KEY).get<std::string>(), payload.at(SEGMENT_KEY).get<std::string>()};
@@ -319,11 +337,43 @@ json EncodePeerRequest(const PeerRequest &request)
     return {{ID_KEY, request.id}, {RANK_KEY, request.rank}, {GENERATION_KEY, request.generation}};
 }
 
+Status DecodePeerRequest(const json &payload, PeerRequest &request)
+{
+    PeerRequest decoded;
+    CHECK_STATUS(DecodePeerRankAndGeneration(payload, decoded.rank, decoded.generation));
+    const auto &id = payload.at(ID_KEY);
+    if (!id.is_string()) {
+        return Status::InvalidArgument("Invalid MemoryEngine peer callback");
+    }
+    decoded.id = id.get<std::string>();
+    request = std::move(decoded);
+    return Status::OK();
+}
+
 json EncodeSharePeerRequest(const SharePeerRequest &request)
 {
     auto payload = EncodeSharedPeer(request.peer);
     payload[ID_KEY] = request.id;
     return payload;
+}
+
+Status DecodeSharePeerDetails(const json &payload, SharedPeer &peer)
+{
+    peer.segment = payload.at(SEGMENT_KEY).get<std::string>();
+    const auto &regions = payload.at(REGIONS_KEY);
+    if (peer.segment.empty() || !regions.is_array()) {
+        return Status::InvalidArgument("Invalid MemoryEngine peer description");
+    }
+
+    peer.regions.reserve(regions.size());
+    for (const auto &entry : regions) {
+        GvaRegion region;
+        if (!ReadRegion(entry, region)) [[unlikely]] {
+            return Status::InvalidArgument("Invalid MemoryEngine mapped region");
+        }
+        peer.regions.push_back(region);
+    }
+    return Status::OK();
 }
 
 json EncodeSharePeersRequest(const SharePeersRequest &request)
@@ -334,6 +384,29 @@ json EncodeSharePeersRequest(const SharePeersRequest &request)
         peers.push_back(EncodeSharedPeer(peer));
     }
     return {{ID_KEY, request.id}, {PEERS_KEY, std::move(peers)}};
+}
+
+Status DecodeSharePeersRequest(const json &payload, uint32_t worldSize, SharePeersRequest &request)
+{
+    request.id = payload.at(ID_KEY).get<std::string>();
+    const auto &peers = payload.at(PEERS_KEY);
+    if (!peers.is_array() || peers.empty() || peers.size() >= static_cast<size_t>(worldSize)) {
+        return Status::InvalidArgument("Invalid MemoryEngine shared peer list");
+    }
+
+    request.peers.reserve(peers.size());
+    std::unordered_set<uint32_t> ranks;
+    ranks.reserve(peers.size());
+    for (const auto &entry : peers) {
+        SharedPeer peer;
+        CHECK_STATUS(DecodePeerRankAndGeneration(entry, peer.rank, peer.generation));
+        if (!ranks.insert(peer.rank).second) {
+            return Status::InvalidArgument("Duplicate MemoryEngine shared peer rank");
+        }
+        CHECK_STATUS(DecodeSharePeerDetails(entry, peer));
+        request.peers.push_back(std::move(peer));
+    }
+    return Status::OK();
 }
 
 json EncodePeerRegionRequest(const PeerRequest &peer, const GvaRegion &region)

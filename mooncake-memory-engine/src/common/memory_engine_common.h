@@ -187,15 +187,19 @@ Status DecodeConfirmRequest(const json &payload, ConfirmRequest &request);
 json EncodeCancelRequest(const CancelRequest &request);
 Status DecodeCancelRequest(const json &payload, CancelRequest &request);
 
+json EncodeJoinRequest(const JoinRequest &request);
 Status DecodeJoinRequest(const json &payload, JoinRequest &request);
 
 Status DecodeRegionRequest(const json &payload, RegionRequest &request);
 
 json EncodePeerRequest(const PeerRequest &request);
+Status DecodePeerRequest(const json &payload, PeerRequest &request);
 
 json EncodeSharePeerRequest(const SharePeerRequest &request);
+Status DecodeSharePeerDetails(const json &payload, SharedPeer &peer);
 
 json EncodeSharePeersRequest(const SharePeersRequest &request);
+Status DecodeSharePeersRequest(const json &payload, uint32_t worldSize, SharePeersRequest &request);
 
 json EncodePeerRegionRequest(const PeerRequest &peer, const GvaRegion &region);
 
