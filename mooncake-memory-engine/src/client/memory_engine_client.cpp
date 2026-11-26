@@ -254,8 +254,8 @@ MemoryEngine::Impl::~Impl()
 Status MemoryEngine::Impl::StartCallbacks(std::string host)
 {
     bool ipv6 = false;
-    const auto status = host.empty() ? discoverLocalIpAddress(host, ipv6) : checkLocalIpAddress(host, ipv6);
-    CHECK_STATUS(status);
+    const auto resolved = host.empty() ? discoverLocalIpAddress(host, ipv6) : checkLocalIpAddress(host, ipv6);
+    CHECK_STATUS(resolved);
     CHECK_STATUS(RegisterHandler(mRpc, MemoryRpc::SharePeer,
                                  [this](const json &request, json &) { return SharePeer(request); }, true));
     CHECK_STATUS(RegisterHandler(mRpc, MemoryRpc::SharePeers,
