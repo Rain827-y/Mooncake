@@ -21,6 +21,8 @@ class MemoryEngine {
     ~MemoryEngine();
 
     Status Join();
+    // Quiesce any direct access to GVA before leaving.
+    Status Leave();
 
    private:
     struct Impl;

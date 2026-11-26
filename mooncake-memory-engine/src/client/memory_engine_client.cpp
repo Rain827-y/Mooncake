@@ -110,12 +110,15 @@ Status CallControl(MemoryEngineRpc &rpc, MemoryRpc op, const PeerCall &server, C
 
 struct MemoryEngine::Impl {
     ~Impl();
-    Status Start(const Config &config);
+    Status Start(std::shared_ptr<const Config> config);
     Status StartCallbacks(std::string host);
     Status Register(const std::optional<uint32_t> &requestedRank, Milliseconds heartbeat);
     Status CreateTransferEngine(const Config &config);
+    Status InitializeRegistration();
+    Status ConfirmRegistration();
     void StartHeartbeat(Milliseconds interval);
     Status Join();
+    Status Leave();
     Status SharePeer(const json &payload);
     Status SharePeers(const json &payload);
     Status UnsharePeer(const json &payload);
@@ -130,7 +133,9 @@ struct MemoryEngine::Impl {
 
     std::mutex mApiMutex;
     std::mutex mPeerMutex;
+    std::shared_ptr<const Config> mConfig;
     Layout mLayout;
+    std::optional<uint32_t> mRequestedRank;
     uint32_t mRank{};
     std::string mServer;
     std::string mId;
@@ -138,7 +143,9 @@ struct MemoryEngine::Impl {
     bool mRegistrationAttempted{};
     bool mJoinAttempted{};
     bool mJoined{};
+    bool mLeaving{};
     Milliseconds mJoinTimeout{DEFAULT_REGISTRATION};
+    Milliseconds mHeartbeatInterval{DEFAULT_HEARTBEAT};
     std::unordered_map<uint32_t, PeerMapping> mPeers;
     MemoryEngineRpc mRpc;
     std::unique_ptr<TransferEngine> mTent;
@@ -147,7 +154,7 @@ struct MemoryEngine::Impl {
 
 MemoryEngine::Impl::~Impl()
 {
-    if (mJoinAttempted) {
+    if (mJoinAttempted || mLeaving) {
         const auto status = ReleaseMembership();
         if (!status.ok()) [[unlikely]] {
             LOG(ERROR) << "MemoryEngine destructor could not release membership, registration ID:" << mId
@@ -161,7 +168,7 @@ MemoryEngine::Impl::~Impl()
                    << ", status:" << static_cast<uint16_t>(stopped.code()) << ".";
     }
     mTent.reset();
-    if (!mJoinAttempted) {
+    if (!mJoinAttempted && !mLeaving) {
         const auto status = CancelRegistration();
         if (!status.ok()) [[unlikely]] {
             LOG(ERROR) << "MemoryEngine Cancel RPC failed, registration ID:" << mId
@@ -192,6 +199,7 @@ Status MemoryEngine::Impl::Register(const std::optional<uint32_t> &requestedRank
     {
         std::lock_guard lock(mPeerMutex);
         mId = NewRegistrationId();
+        mPeers.clear();
     }
     const RegisterRequest request{mId, mLayout, mCallbackAddress, requestedRank};
     mRegistrationAttempted = true;
@@ -395,8 +403,14 @@ Status MemoryEngine::Impl::UnsharePeer(const json &payload)
 Status MemoryEngine::Impl::Join()
 {
     std::lock_guard lock(mApiMutex);
+    if (mLeaving) {
+        return Status::TooManyRequests("Retry MemoryEngine leave before rejoining");
+    }
     if (mJoined) {
         return Status::OK();
+    }
+    if (!mTent) {
+        CHECK_STATUS(InitializeRegistration());
     }
     const PeerCall server{mServer, EncodeJoinRequest({mId, mTent->getSegmentName()})};
     mJoinAttempted = true;
@@ -408,6 +422,15 @@ Status MemoryEngine::Impl::Join()
     }
     mJoined = true;
     return Status::OK();
+}
+
+Status MemoryEngine::Impl::Leave()
+{
+    std::lock_guard lock(mApiMutex);
+    if (!mRegistrationAttempted) {
+        return Status::OK();
+    }
+    return ReleaseMembership();
 }
 
 Status MemoryEngine::Impl::ClearPeers()
@@ -428,14 +451,26 @@ Status MemoryEngine::Impl::ClearPeers()
 
 Status MemoryEngine::Impl::ReleaseMembership()
 {
-    const PeerCall server{mServer, EncodeRegistrationIdRequest({mId})};
-    CHECK_STATUS(CallControl(mRpc, MemoryRpc::BeginLeave, server, Clock::now() + mJoinTimeout));
-    CHECK_STATUS(ClearPeers());
-    CHECK_STATUS(CallAsync(mRpc, MemoryRpc::FinishLeave, server, Clock::now() + RPC_TIMEOUT).get());
-    mHeartbeat = std::jthread();
+    mLeaving = true;
     mJoined = false;
+    const PeerCall server{mServer, EncodeRegistrationIdRequest({mId})};
+    const auto begin = CallControl(mRpc, MemoryRpc::BeginLeave, server, Clock::now() + mJoinTimeout);
+    if (!begin.ok()) [[unlikely]] {
+        LOG(ERROR) << "MemoryEngine BeginLeave failed, registration ID:" << mId << ", rank:" << mRank
+                   << ", status:" << static_cast<uint16_t>(begin.code()) << ".";
+        return begin;
+    }
+    CHECK_STATUS(ClearPeers());
+    const auto finish = CallAsync(mRpc, MemoryRpc::FinishLeave, server, Clock::now() + RPC_TIMEOUT).get();
+    if (!finish.ok()) [[unlikely]] {
+        LOG(ERROR) << "MemoryEngine FinishLeave failed, registration ID:" << mId << ", rank:" << mRank
+                   << ", status:" << static_cast<uint16_t>(finish.code()) << ".";
+        return finish;
+    }
+    mHeartbeat = std::jthread();
     mJoinAttempted = false;
     mRegistrationAttempted = false;
+    mLeaving = false;
     return Status::OK();
 }
 
@@ -473,29 +508,54 @@ void MemoryEngine::Impl::StartHeartbeat(Milliseconds interval)
     });
 }
 
-Status MemoryEngine::Impl::Start(const Config &config)
+Status MemoryEngine::Impl::Start(std::shared_ptr<const Config> config)
 {
     ClientOptions options;
-    CHECK_STATUS(ReadClientOptions(config, options));
-    mJoinTimeout = Milliseconds(config.get(config_keys::CONFIG_JOIN_TIMEOUT_MS, DEFAULT_REGISTRATION.count()));
+    CHECK_STATUS(ReadClientOptions(*config, options));
+    mJoinTimeout = Milliseconds(config->get(config_keys::CONFIG_JOIN_TIMEOUT_MS, DEFAULT_REGISTRATION.count()));
     if (mJoinTimeout <= Milliseconds::zero() || mJoinTimeout >= MAX_TIMEOUT) {
         LOG(ERROR) << "Invalid MemoryEngine join timeout, milliseconds:" << mJoinTimeout.count() << ".";
         return Status::InvalidArgument("Invalid MemoryEngine join timeout");
     }
+    mConfig = std::move(config);
     mLayout = options.layout;
+    mRequestedRank = options.requestedRank;
+    mHeartbeatInterval = options.heartbeat;
     const auto &server = options.server;
     mServer = buildIpAddrWithPort(server.host, server.port, server.ipv6);
     CHECK_STATUS(StartCallbacks(std::move(options.callbackHost)));
-    CHECK_STATUS(Register(options.requestedRank, options.heartbeat));
-    CHECK_STATUS(CreateTransferEngine(config));
+    return InitializeRegistration();
+}
+
+Status MemoryEngine::Impl::InitializeRegistration()
+{
+    CHECK_STATUS(CancelRegistration());
+    const auto status = ConfirmRegistration();
+    if (!status.ok()) [[unlikely]] {
+        auto cleanup = ClearPeers();
+        if (cleanup.ok()) {
+            cleanup = CancelRegistration();
+        }
+        if (!cleanup.ok()) [[unlikely]] {
+            LOG(ERROR) << "Failed to roll back MemoryEngine registration, registration ID:" << mId
+                       << ", rank:" << mRank << ", status:" << static_cast<uint16_t>(cleanup.code()) << ".";
+        }
+        return status;
+    }
+    StartHeartbeat(mHeartbeatInterval);
+    return Status::OK();
+}
+
+Status MemoryEngine::Impl::ConfirmRegistration()
+{
+    CHECK_STATUS(Register(mRequestedRank, mHeartbeatInterval));
+    CHECK_STATUS(CreateTransferEngine(*mConfig));
     const auto status = Call(mRpc, mServer, MemoryRpc::Confirm, EncodeConfirmRequest({mId, mRank}));
     if (!status.ok()) [[unlikely]] {
         LOG(ERROR) << "MemoryEngine Confirm request failed, registration ID:" << mId << ", rank:" << mRank
                    << ", status:" << static_cast<uint16_t>(status.code()) << ".";
-        return status;
     }
-    StartHeartbeat(options.heartbeat);
-    return Status::OK();
+    return status;
 }
 
 MemoryEngine::MemoryEngine(std::unique_ptr<Impl> impl) : mImpl(std::move(impl))
@@ -517,7 +577,7 @@ Status MemoryEngine::Create(const Config &config, std::unique_ptr<MemoryEngine> 
     if (!result) {
         return Status::InternalError("Could not allocate MemoryEngine");
     }
-    const auto status = result->mImpl->Start(*config.freeze());
+    const auto status = result->mImpl->Start(config.freeze());
     if (!status.ok()) {
         LOG(ERROR) << "Failed to create MemoryEngine, status:" << static_cast<uint16_t>(status.code()) << ".";
         return status;
@@ -536,6 +596,11 @@ Status MemoryEngine::Create(std::unique_ptr<MemoryEngine> *engine)
 Status MemoryEngine::Join()
 {
     return mImpl->Join();
+}
+
+Status MemoryEngine::Leave()
+{
+    return mImpl->Leave();
 }
 
 }
