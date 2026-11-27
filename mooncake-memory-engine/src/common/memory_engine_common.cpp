@@ -1,7 +1,6 @@
 // Copyright 2026 KVCache.AI
 // SPDX-License-Identifier: Apache-2.0
 
-#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <limits>
@@ -21,7 +20,6 @@ namespace tent {
 namespace {
 
 constexpr uint64_t MAX_WINDOW = 1ULL << 50;
-constexpr auto MAX_TIMEOUT_MS = static_cast<uint64_t>(std::chrono::duration_cast<Milliseconds>(MAX_TIMEOUT).count());
 constexpr std::string_view RPC_SCHEME = "rpc://";
 constexpr char ID_KEY[] = "id";
 constexpr char WORLD_SIZE_KEY[] = "worldSize";
@@ -29,7 +27,6 @@ constexpr char HOST_WINDOW_KEY[] = "hostWindow";
 constexpr char DEVICE_WINDOW_KEY[] = "deviceWindow";
 constexpr char CALLBACK_KEY[] = "callback";
 constexpr char RANK_KEY[] = "rank";
-constexpr char LEASE_MS_KEY[] = "leaseMs";
 constexpr char GVA_BASE_KEY[] = "gvaBase";
 constexpr char SEGMENT_KEY[] = "segment";
 constexpr char GENERATION_KEY[] = "generation";
@@ -262,28 +259,20 @@ Status DecodeRegisterRequest(const json &payload, RegisterRequest &request)
     }
 }
 
-json EncodeRegisterResponse(const RegisterResponse &response, const Status &status)
+json EncodeRegisterResponse(const RegisterResponse &response)
 {
-    if (status.ok()) {
-        return {{RANK_KEY, response.rank}, {LEASE_MS_KEY, response.leaseMs}, {GVA_BASE_KEY, response.gvaBase}};
-    }
-    // A rejected rank request can still include the lease duration.
-    if (response.leaseMs) {
-        return {{LEASE_MS_KEY, response.leaseMs}};
-    }
-    return json::object();
+    return {{RANK_KEY, response.rank}, {GVA_BASE_KEY, response.gvaBase}};
 }
 
 Status DecodeRegisterResponse(const json &payload, uint32_t worldSize, RegisterResponse &response)
 {
     try {
         const auto rank = ReadUnsigned(payload.at(RANK_KEY), worldSize - 1);
-        const auto lease = ReadUnsigned(payload.at(LEASE_MS_KEY), MAX_TIMEOUT_MS);
         const auto gvaBase = ReadUnsigned(payload.at(GVA_BASE_KEY), UINT64_MAX);
-        if (!rank || !lease || !gvaBase || !*gvaBase) [[unlikely]] {
+        if (!rank || !gvaBase || !*gvaBase) [[unlikely]] {
             return Status::RpcServiceError("Invalid MemoryEngine registration reply");
         }
-        response = {static_cast<uint32_t>(*rank), *lease, *gvaBase};
+        response = {static_cast<uint32_t>(*rank), *gvaBase};
         return Status::OK();
     } catch (const json::exception &) {
         return Status::MalformedJson("Malformed MemoryEngine registration reply");

@@ -11,7 +11,6 @@
             "world_size": 1,
             "host_mem_max": 0,
             "device_mem_max": 1073741824,
-            "rank_lease_ms": 20000,
             "rpc_server_threads": 4
         }
     }

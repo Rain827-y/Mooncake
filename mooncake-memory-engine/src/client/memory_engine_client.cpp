@@ -31,7 +31,6 @@ namespace mooncake {
 namespace tent {
 namespace {
 
-constexpr auto DEFAULT_HEARTBEAT = Milliseconds(3000);
 constexpr auto DEFAULT_BATCH_COPY_TIMEOUT = Milliseconds(30000);
 constexpr size_t ALLOCATION_ALIGNMENT = 2UL << 20;
 constexpr int REGISTRATION_ID_WORDS = 4;
@@ -47,7 +46,6 @@ struct ClientOptions {
     std::string callbackHost;
     Layout layout;
     std::optional<uint32_t> requestedRank;
-    Milliseconds heartbeat{DEFAULT_HEARTBEAT};
 };
 
 struct RemoteRegion {
@@ -123,10 +121,6 @@ Status ReadClientOptions(const Config &config, ClientOptions &options)
         options.requestedRank = static_cast<uint32_t>(*rank);
     }
     options.callbackHost = config.get(config_keys::CONFIG_CLIENT_HOST, "");
-    options.heartbeat = Milliseconds(config.get(config_keys::CONFIG_HEARTBEAT_INTERVAL_MS, DEFAULT_HEARTBEAT.count()));
-    if (options.heartbeat <= Milliseconds::zero() || options.heartbeat >= MAX_TIMEOUT) {
-        return Status::InvalidArgument("Invalid MemoryEngine heartbeat interval");
-    }
     return Status::OK();
 }
 
@@ -159,11 +153,10 @@ struct MemoryEngine::Impl {
     ~Impl();
     Status Start(std::shared_ptr<const Config> config);
     Status StartCallbacks(std::string host);
-    Status Register(const std::optional<uint32_t> &requestedRank, Milliseconds heartbeat, RegisterResponse &response);
+    Status Register(const std::optional<uint32_t> &requestedRank, RegisterResponse &response);
     Status CreateTransferEngine(const Config &config, uint64_t gvaBase);
     Status InitializeRegistration();
     Status ConfirmRegistration();
-    void StartHeartbeat(Milliseconds interval);
     Status Join();
     Status Leave();
     Status Allocate(size_t size, MemoryEngineMemType type, void **address);
@@ -205,8 +198,7 @@ struct MemoryEngine::Impl {
     bool mJoinAttempted{};
     bool mJoined{};
     bool mLeaving{};
-    Milliseconds mJoinTimeout{DEFAULT_REGISTRATION};
-    Milliseconds mHeartbeatInterval{DEFAULT_HEARTBEAT};
+    Milliseconds mJoinTimeout{DEFAULT_JOIN_TIMEOUT};
     Milliseconds mBatchCopyTimeout{DEFAULT_BATCH_COPY_TIMEOUT};
     std::unordered_map<uint32_t, PeerMapping> mPeers;
     std::map<uint64_t, RemoteCopyRegion> mRemoteCopyRegions;
@@ -216,7 +208,6 @@ struct MemoryEngine::Impl {
     size_t mLiveRegions{};
     MemoryEngineRpc mRpc;
     std::unique_ptr<TransferEngine> mTent;
-    std::jthread mHeartbeat;
 };
 
 MemoryEngine::Impl::~Impl()
@@ -228,7 +219,6 @@ MemoryEngine::Impl::~Impl()
                        << ", rank:" << mRank << ", status:" << static_cast<uint16_t>(status.code()) << ".";
         }
     }
-    mHeartbeat = std::jthread();
     const auto stopped = mRpc.Stop();
     if (!stopped.ok()) [[unlikely]] {
         LOG(ERROR) << "Failed to stop MemoryEngine callback RPC, registration ID:" << mId
@@ -267,8 +257,7 @@ Status MemoryEngine::Impl::StartCallbacks(std::string host)
     return Status::OK();
 }
 
-Status MemoryEngine::Impl::Register(const std::optional<uint32_t> &requestedRank, Milliseconds heartbeat,
-                                    RegisterResponse &response)
+Status MemoryEngine::Impl::Register(const std::optional<uint32_t> &requestedRank, RegisterResponse &response)
 {
     {
         std::lock_guard lock(mPeerMutex);
@@ -290,12 +279,6 @@ Status MemoryEngine::Impl::Register(const std::optional<uint32_t> &requestedRank
         LOG(ERROR) << "Invalid MemoryEngine Register response, registration ID:" << mId
                    << ", error:" << decodeRet.message() << ".";
         return decodeRet;
-    }
-    if (static_cast<uint64_t>(heartbeat.count()) >= response.leaseMs) [[unlikely]] {
-        LOG(ERROR) << "MemoryEngine heartbeat interval exceeds or equals rank lease, registration ID:" << mId
-                   << ", rank:" << response.rank << ", heartbeat interval ms:" << heartbeat.count()
-                   << ", rank lease ms:" << response.leaseMs << ".";
-        return Status::InvalidArgument("MemoryEngine heartbeat interval must be shorter than the server lease");
     }
     std::lock_guard lock(mPeerMutex);
     mRank = response.rank;
@@ -905,7 +888,6 @@ Status MemoryEngine::Impl::ReleaseMembership()
                    << ", status:" << static_cast<uint16_t>(finish.code()) << ".";
         return finish;
     }
-    mHeartbeat = std::jthread();
     mJoinAttempted = false;
     mRegistrationAttempted = false;
     mLeaving = false;
@@ -924,33 +906,11 @@ Status MemoryEngine::Impl::CancelRegistration()
     return status;
 }
 
-void MemoryEngine::Impl::StartHeartbeat(Milliseconds interval)
-{
-    mHeartbeat = std::jthread([this, interval](std::stop_token stop) {
-        auto lastCode = Status::Code::kOk;
-        const auto request = EncodeRegistrationIdRequest({mId});
-        RunPeriodic(stop, interval, [&] {
-            const auto status = Call(mRpc, mServer, MemoryRpc::Heartbeat, request);
-            const auto code = status.code();
-            if (!status.ok() && code != lastCode) {
-                if (status.IsInvalidEntry()) {
-                    LOG(ERROR) << "MemoryEngine server rejected the heartbeat registration, registration ID:" << mId
-                               << ", rank:" << mRank << ", status:" << static_cast<uint16_t>(code) << ".";
-                } else {
-                    LOG(WARNING) << "MemoryEngine Heartbeat RPC failed, registration ID:" << mId << ", rank:" << mRank
-                                 << ", status:" << static_cast<uint16_t>(code) << ".";
-                }
-            }
-            lastCode = code;
-        });
-    });
-}
-
 Status MemoryEngine::Impl::Start(std::shared_ptr<const Config> config)
 {
     ClientOptions options;
     CHECK_STATUS(ReadClientOptions(*config, options));
-    mJoinTimeout = Milliseconds(config->get(config_keys::CONFIG_JOIN_TIMEOUT_MS, DEFAULT_REGISTRATION.count()));
+    mJoinTimeout = Milliseconds(config->get(config_keys::CONFIG_JOIN_TIMEOUT_MS, DEFAULT_JOIN_TIMEOUT.count()));
     if (mJoinTimeout <= Milliseconds::zero() || mJoinTimeout >= MAX_TIMEOUT) {
         LOG(ERROR) << "Invalid MemoryEngine join timeout, milliseconds:" << mJoinTimeout.count() << ".";
         return Status::InvalidArgument("Invalid MemoryEngine join timeout");
@@ -964,7 +924,6 @@ Status MemoryEngine::Impl::Start(std::shared_ptr<const Config> config)
     mConfig = std::move(config);
     mLayout = options.layout;
     mRequestedRank = options.requestedRank;
-    mHeartbeatInterval = options.heartbeat;
     const auto &server = options.server;
     mServer = buildIpAddrWithPort(server.host, server.port, server.ipv6);
 
@@ -993,14 +952,13 @@ Status MemoryEngine::Impl::InitializeRegistration()
         }
         return status;
     }
-    StartHeartbeat(mHeartbeatInterval);
     return Status::OK();
 }
 
 Status MemoryEngine::Impl::ConfirmRegistration()
 {
     RegisterResponse response;
-    CHECK_STATUS(Register(mRequestedRank, mHeartbeatInterval, response));
+    CHECK_STATUS(Register(mRequestedRank, response));
     CHECK_STATUS(CreateTransferEngine(*mConfig, response.gvaBase));
     const auto status = Call(mRpc, mServer, MemoryRpc::Confirm, EncodeConfirmRequest({mId, mRank}));
     if (!status.ok()) [[unlikely]] {

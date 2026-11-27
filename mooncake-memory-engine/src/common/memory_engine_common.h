@@ -5,14 +5,11 @@
 #define TENT_SRC_MEMORY_ENGINE_COMMON_H
 
 #include <chrono>
-#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <future>
 #include <limits>
-#include <mutex>
 #include <optional>
-#include <stop_token>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -29,7 +26,7 @@ using Clock = std::chrono::steady_clock;
 using Milliseconds = std::chrono::milliseconds;
 
 inline constexpr uint64_t GIB = 1ULL << 30;
-inline constexpr auto DEFAULT_REGISTRATION = Milliseconds(120000);
+inline constexpr auto DEFAULT_JOIN_TIMEOUT = Milliseconds(120000);
 inline constexpr auto RPC_TIMEOUT = Milliseconds(5000);
 inline constexpr auto RETRY_INTERVAL = Milliseconds(20);
 inline constexpr auto MAX_TIMEOUT = std::chrono::hours(24);
@@ -47,14 +44,12 @@ inline constexpr char CONFIG_DEVICE_MEM_MAX[] = "memory_engine/device_mem_max";
 inline constexpr char CONFIG_AUTO_RANKING[] = "memory_engine/auto_ranking";
 inline constexpr char CONFIG_LOCAL_RANK[] = "memory_engine/local_rank";
 inline constexpr char CONFIG_CLIENT_HOST[] = "memory_engine/client_host";
-inline constexpr char CONFIG_HEARTBEAT_INTERVAL_MS[] = "memory_engine/heartbeat_interval_ms";
 inline constexpr char CONFIG_JOIN_TIMEOUT_MS[] = "memory_engine/join_timeout_ms";
 inline constexpr char CONFIG_BATCH_COPY_TIMEOUT_MS[] = "memory_engine/batch_copy_timeout_ms";
 
 inline constexpr char CONFIG_SERVER_WORLD_SIZE[] = "memory_engine/server/world_size";
 inline constexpr char CONFIG_SERVER_HOST_MEM_MAX[] = "memory_engine/server/host_mem_max";
 inline constexpr char CONFIG_SERVER_DEVICE_MEM_MAX[] = "memory_engine/server/device_mem_max";
-inline constexpr char CONFIG_SERVER_RANK_LEASE_MS[] = "memory_engine/server/rank_lease_ms";
 inline constexpr char CONFIG_SERVER_RPC_SERVER_THREADS[] = "memory_engine/server/rpc_server_threads";
 
 }
@@ -62,8 +57,7 @@ inline constexpr char CONFIG_SERVER_RPC_SERVER_THREADS[] = "memory_engine/server
 enum class MemoryRpc {
     Register = 100,
     Confirm,
-    Heartbeat,
-    Cancel,
+    Cancel = 103, // Keep existing RPC IDs stable.
     Join,
     SharePeer,
     UnsharePeer,
@@ -98,7 +92,6 @@ struct RegisterRequest {
 
 struct RegisterResponse {
     uint32_t rank{};
-    uint64_t leaseMs{};
     uint64_t gvaBase{};
 };
 
@@ -184,7 +177,7 @@ Status ReadLayout(const Config &config, const char *worldSizeKey, const char *ho
 json EncodeRegisterRequest(const RegisterRequest &request);
 Status DecodeRegisterRequest(const json &payload, RegisterRequest &request);
 
-json EncodeRegisterResponse(const RegisterResponse &response, const Status &status);
+json EncodeRegisterResponse(const RegisterResponse &response);
 Status DecodeRegisterResponse(const json &payload, uint32_t worldSize, RegisterResponse &response);
 
 json EncodeRegistrationIdRequest(const RegistrationIdRequest &request);
@@ -246,20 +239,6 @@ Status RegisterRequestHandler(MemoryEngineRpc &rpc, MemoryRpc op, Status (*decod
         CHECK_STATUS(decode(payload, request));
         return handler(request);
     }, offload);
-}
-
-template <typename Tick>
-void RunPeriodic(std::stop_token stop, Milliseconds interval, Tick tick)
-{
-    std::mutex mutex;
-    std::condition_variable_any wake;
-    std::unique_lock lock(mutex);
-    while (!stop.stop_requested()) {
-        wake.wait_for(lock, stop, interval, [] { return false; });
-        if (!stop.stop_requested()) {
-            tick();
-        }
-    }
 }
 
 }

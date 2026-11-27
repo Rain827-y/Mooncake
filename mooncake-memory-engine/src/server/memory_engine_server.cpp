@@ -33,10 +33,7 @@ namespace mooncake {
 namespace tent {
 namespace {
 
-constexpr auto DEFAULT_LEASE = Milliseconds(20000);
-constexpr auto REAP_INTERVAL = Milliseconds(1000);
 constexpr size_t DEFAULT_RPC_THREADS = 4;
-constexpr int HEARTBEAT_LOG_EVERY = 100;
 constexpr uint64_t HYBM_GLOBAL_GVM_START_ADDR = 0x340000000000UL;
 
 enum class MemberState { Pending, Registered, Joining, Joined, Leaving };
@@ -46,7 +43,6 @@ struct Registration {
     uint32_t rank{};
     std::string id;
     std::string callback;
-    Clock::time_point expires;
     MemberState state{MemberState::Pending};
     std::string segment{};
     uint64_t generation{};
@@ -223,7 +219,6 @@ struct MemoryEngineServer::Impl {
     Status HandleBeginLeave(const json &payload);
     Status Register(const RegisterRequest &request, RegisterResponse &response);
     Status Confirm(const ConfirmRequest &request);
-    Status Heartbeat(const RegistrationIdRequest &request);
     Status Cancel(const CancelRequest &request);
     Status Join(const json &payload);
     Status PrepareJoin(const JoinRequest &request, Registration &member, std::vector<Registration> &peers);
@@ -241,7 +236,6 @@ struct MemoryEngineServer::Impl {
     Status ClaimRank(std::optional<uint32_t> requested, uint32_t &rank);
     void ReleaseRank(uint32_t rank);
     void ResetUnconfirmedLayout();
-    void Reap();
 
     std::mutex mMutex;
     std::atomic<uint64_t> mMutating{0};
@@ -253,15 +247,12 @@ struct MemoryEngineServer::Impl {
     bool mLayoutConfirmed{};
     std::unordered_map<std::string, Registration> mRegistrations;
     std::set<uint32_t> mFreeRanks;
-    Milliseconds mLease{DEFAULT_LEASE};
-    Milliseconds mRegistrationTimeout{DEFAULT_REGISTRATION};
+    Milliseconds mJoinTimeout{DEFAULT_JOIN_TIMEOUT};
     MemoryEngineRpc mRpc;
-    std::jthread mReaper;
 };
 
 MemoryEngineServer::Impl::~Impl()
 {
-    mReaper = std::jthread();
     const auto status = mRpc.Stop();
     if (!status.ok()) {
         LOG(ERROR) << "Failed to stop MemoryEngine server RPC, port:" << mEndpoint.port
@@ -279,13 +270,10 @@ Status MemoryEngineServer::Impl::Start(const Config &config, const Endpoint &end
         return Status::InvalidArgument("Invalid MemoryEngine server GVA windows");
     }
 
-    mLease = Milliseconds(config.get(config_keys::CONFIG_SERVER_RANK_LEASE_MS, DEFAULT_LEASE.count()));
-    mRegistrationTimeout = Milliseconds(config.get(config_keys::CONFIG_JOIN_TIMEOUT_MS, DEFAULT_REGISTRATION.count()));
-    if (mLease <= Milliseconds::zero() || mRegistrationTimeout <= Milliseconds::zero() ||
-        mLease >= MAX_TIMEOUT || mRegistrationTimeout >= MAX_TIMEOUT) {
-        LOG(ERROR) << "Invalid MemoryEngine server timeouts, rank lease ms:" << mLease.count()
-                   << ", registration timeout ms:" << mRegistrationTimeout.count() << ".";
-        return Status::InvalidArgument("Invalid MemoryEngine server timeouts");
+    mJoinTimeout = Milliseconds(config.get(config_keys::CONFIG_JOIN_TIMEOUT_MS, DEFAULT_JOIN_TIMEOUT.count()));
+    if (mJoinTimeout <= Milliseconds::zero() || mJoinTimeout >= MAX_TIMEOUT) {
+        LOG(ERROR) << "Invalid MemoryEngine server join timeout, milliseconds:" << mJoinTimeout.count() << ".";
+        return Status::InvalidArgument("Invalid MemoryEngine server join timeout");
     }
     const auto threads =
         ReadUnsigned(config.get(config_keys::CONFIG_SERVER_RPC_SERVER_THREADS, json(DEFAULT_RPC_THREADS)),
@@ -297,9 +285,7 @@ Status MemoryEngineServer::Impl::Start(const Config &config, const Endpoint &end
     CHECK_STATUS(RegisterRpcHandlers());
     auto listener = endpoint;
     CHECK_STATUS(checkLocalIpAddress(listener.host, listener.ipv6));
-    CHECK_STATUS(mRpc.StartAt(listener.host, listener.port, static_cast<size_t>(*threads)));
-    mReaper = std::jthread([this](std::stop_token stop) { RunPeriodic(stop, REAP_INTERVAL, [this] { Reap(); }); });
-    return Status::OK();
+    return mRpc.StartAt(listener.host, listener.port, static_cast<size_t>(*threads));
 }
 
 Status MemoryEngineServer::Impl::CheckEndpoint(const Endpoint &endpoint) const
@@ -316,8 +302,6 @@ Status MemoryEngineServer::Impl::RegisterRpcHandlers()
                                  [this](const json &payload, json &reply) { return HandleRegister(payload, reply); }));
     CHECK_STATUS(RegisterRequestHandler(mRpc, MemoryRpc::Confirm, DecodeConfirmRequest,
                                         [this](const ConfirmRequest &request) { return Confirm(request); }));
-    CHECK_STATUS(RegisterRequestHandler(mRpc, MemoryRpc::Heartbeat, DecodeRegistrationIdRequest,
-                                        [this](const RegistrationIdRequest &request) { return Heartbeat(request); }));
     CHECK_STATUS(RegisterRequestHandler(mRpc, MemoryRpc::Cancel, DecodeCancelRequest,
                                         [this](const CancelRequest &request) { return Cancel(request); }));
     CHECK_STATUS(RegisterHandler(mRpc, MemoryRpc::Join,
@@ -346,9 +330,9 @@ Status MemoryEngineServer::Impl::HandleRegister(const json &payload, json &reply
     }
 
     RegisterResponse response;
-    const auto status = Register(request, response);
-    reply = EncodeRegisterResponse(response, status);
-    return status;
+    CHECK_STATUS(Register(request, response));
+    reply = EncodeRegisterResponse(response);
+    return Status::OK();
 }
 
 Status MemoryEngineServer::Impl::HandleBeginLeave(const json &payload)
@@ -422,11 +406,10 @@ Status MemoryEngineServer::Impl::Register(const RegisterRequest &request, Regist
                    << ", cluster device window bytes:" << mLayout.deviceWindow << ".";
         return Status::InvalidArgument("MemoryEngine rank layout differs from registered server layout");
     }
-    response.leaseMs = static_cast<uint64_t>(mLease.count());
     response.gvaBase = HYBM_GLOBAL_GVM_START_ADDR;
     auto found = mRegistrations.find(request.id);
     if (found != mRegistrations.end()) {
-        if (found->second.expires <= Clock::now() || found->second.callback != request.callbackAddress ||
+        if (found->second.callback != request.callbackAddress ||
             (request.requestedRank && *request.requestedRank != found->second.rank)) {
             LOG(WARNING) << "MemoryEngine Register ID is already in use, registration ID:" << request.id
                          << ", registered rank:" << found->second.rank << ", requested rank:"
@@ -446,8 +429,7 @@ Status MemoryEngineServer::Impl::Register(const RegisterRequest &request, Regist
                      << ", status:" << static_cast<uint16_t>(status.code()) << ".";
         return status;
     }
-    const auto expires = Clock::now() + mRegistrationTimeout;
-    mRegistrations.emplace(request.id, Registration{rank, request.id, request.callbackAddress, expires});
+    mRegistrations.emplace(request.id, Registration{rank, request.id, request.callbackAddress});
     response.rank = rank;
     return Status::OK();
 }
@@ -456,39 +438,16 @@ Status MemoryEngineServer::Impl::Confirm(const ConfirmRequest &request)
 {
     std::lock_guard lock(mMutex);
     auto found = mRegistrations.find(request.id);
-    if (found == mRegistrations.end() || found->second.rank != request.rank ||
-        found->second.expires <= Clock::now()) {
-        LOG(WARNING) << "MemoryEngine Confirm registration expired, unknown or mismatched, registration ID:"
+    if (found == mRegistrations.end() || found->second.rank != request.rank) {
+        LOG(WARNING) << "MemoryEngine Confirm registration unknown or mismatched, registration ID:"
                      << request.id << ", reported rank:" << request.rank << ", registered rank:"
                      << (found != mRegistrations.end() ? std::to_string(found->second.rank) : "unknown") << ".";
-        return Status::InvalidEntry("MemoryEngine registration expired or unknown");
+        return Status::InvalidEntry("MemoryEngine registration unknown or mismatched");
     }
     mLayoutConfirmed = true;
     if (found->second.state == MemberState::Pending) {
         found->second.state = MemberState::Registered;
     }
-    found->second.expires = Clock::now() + mLease;
-    return Status::OK();
-}
-
-Status MemoryEngineServer::Impl::Heartbeat(const RegistrationIdRequest &request)
-{
-    std::lock_guard lock(mMutex);
-    auto found = mRegistrations.find(request.id);
-    const auto now = Clock::now();
-    if (found == mRegistrations.end()) {
-        LOG_EVERY_N(WARNING, HEARTBEAT_LOG_EVERY)
-            << "MemoryEngine Heartbeat registration unknown, registration ID:" << request.id << ", rank:unknown.";
-        return Status::InvalidEntry("MemoryEngine registration expired or unknown");
-    }
-    const auto &member = found->second;
-    if (member.state == MemberState::Pending || member.expires <= now) {
-        LOG_EVERY_N(WARNING, HEARTBEAT_LOG_EVERY)
-            << "MemoryEngine Heartbeat rejected, registration ID:" << request.id << ", rank:" << member.rank
-            << ", reason:" << (member.expires <= now ? "lease expired" : "registration pending") << ".";
-        return Status::InvalidEntry("MemoryEngine registration expired or unknown");
-    }
-    found->second.expires = now + mLease;
     return Status::OK();
 }
 
@@ -509,34 +468,6 @@ Status MemoryEngineServer::Impl::Cancel(const CancelRequest &request)
     return Status::OK();
 }
 
-void MemoryEngineServer::Impl::Reap()
-{
-    Mutation mutation(mMutating);
-    if (!mutation.Acquired()) {
-        return;
-    }
-    const auto now = Clock::now();
-    std::vector<std::pair<std::string, uint32_t>> expired;
-    {
-        std::lock_guard lock(mMutex);
-        for (const auto &[id, member] : mRegistrations) {
-            if (member.expires <= now) {
-                expired.emplace_back(id, member.rank);
-            }
-        }
-    }
-    for (const auto &[id, rank] : expired) {
-        auto status = BeginLeave(id);
-        if (status.ok()) {
-            status = FinishLeave(id);
-        }
-        if (!status.ok()) {
-            LOG(ERROR) << "Could not reclaim expired MemoryEngine registration, registration ID:" << id
-                       << ", rank:" << rank << ", status:" << static_cast<uint16_t>(status.code()) << ".";
-        }
-    }
-}
-
 Status MemoryEngineServer::Impl::PrepareLeave(const std::string &id, std::vector<PeerCallback> &calls)
 {
     std::lock_guard lock(mMutex);
@@ -550,9 +481,8 @@ Status MemoryEngineServer::Impl::PrepareLeave(const std::string &id, std::vector
         return Status::OK();
     }
 
-    const auto now = Clock::now();
     for (const auto &[peerId, peer] : mRegistrations) {
-        if (peerId == id || !peer.generation || peer.expires <= now) {
+        if (peerId == id || !peer.generation) {
             continue;
         }
         calls.push_back(UnshareRequest(peer, member));
@@ -598,11 +528,10 @@ Status MemoryEngineServer::Impl::PrepareJoin(const JoinRequest &request, Registr
     std::lock_guard lock(mMutex);
     auto found = mRegistrations.find(request.id);
     if (found == mRegistrations.end() || found->second.state == MemberState::Pending ||
-        found->second.state == MemberState::Leaving ||
-        found->second.expires <= Clock::now()) {
+        found->second.state == MemberState::Leaving) {
         LOG(WARNING) << "MemoryEngine Join registration unavailable, registration ID:" << request.id << ", rank:"
                      << (found != mRegistrations.end() ? std::to_string(found->second.rank) : "unknown") << ".";
-        return Status::InvalidEntry("MemoryEngine registration expired or unknown");
+        return Status::InvalidEntry("MemoryEngine registration unavailable");
     }
 
     auto &current = found->second;
@@ -636,7 +565,7 @@ Status MemoryEngineServer::Impl::SharePeersForJoin(const Registration &member, c
         return Status::OK();
     }
 
-    const auto deadline = Clock::now() + mRegistrationTimeout;
+    const auto deadline = Clock::now() + mJoinTimeout;
     std::vector<PeerCallback> calls;
     calls.reserve(peers.size());
     for (const auto &peer : peers) {
@@ -741,14 +670,8 @@ Status MemoryEngineServer::Impl::Join(const json &payload)
     status = SharePeersForJoin(member, peers);
     if (status.ok()) {
         std::lock_guard lock(mMutex);
-        auto &current = mRegistrations.at(request.id);
-        if (current.expires > Clock::now()) {
-            current.state = MemberState::Joined;
-            return status;
-        }
-        LOG(WARNING) << "MemoryEngine lease expired during Join, registration ID:" << request.id
-                     << ", rank:" << current.rank << ".";
-        status = Status::InvalidEntry("MemoryEngine registration expired during join");
+        mRegistrations.at(request.id).state = MemberState::Joined;
+        return status;
     }
     const auto cleanup = RollbackJoin(member, peers);
     return cleanup.ok() ? status : cleanup;
@@ -759,15 +682,12 @@ Status MemoryEngineServer::Impl::PrepareRegion(const std::string &id, const GvaR
 {
     std::lock_guard lock(mMutex);
     auto found = mRegistrations.find(id);
-    const auto now = Clock::now();
     const bool registered = found != mRegistrations.end();
-    const bool expired = registered && found->second.expires <= now;
-    if (!registered || found->second.state != MemberState::Joined || expired) [[unlikely]] {
+    if (!registered || found->second.state != MemberState::Joined) [[unlikely]] {
         const auto state = registered ? MEMBER_STATE_NAMES[static_cast<size_t>(found->second.state)] : "unknown";
-        const auto leaseExpired = registered ? (expired ? "true" : "false") : "unknown";
         LOG(WARNING) << "MemoryEngine region owner rejected, registration ID:" << id
                      << ", rank:" << (registered ? std::to_string(found->second.rank) : "unknown")
-                     << ", state:" << state << ", lease expired:" << leaseExpired << ", bytes:" << region.size << ".";
+                     << ", state:" << state << ", bytes:" << region.size << ".";
         return Status::InvalidEntry("MemoryEngine owner is not joined");
     }
     auto &owner = found->second;
@@ -801,7 +721,7 @@ Status MemoryEngineServer::Impl::PrepareRegion(const std::string &id, const GvaR
     }
 
     for (const auto &[peerId, peer] : mRegistrations) {
-        const bool available = publish ? peer.state == MemberState::Joined : peer.generation && peer.expires > now;
+        const bool available = publish ? peer.state == MemberState::Joined : peer.generation != 0;
         if (peerId == id || !available) {
             continue;
         }
