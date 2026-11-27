@@ -99,6 +99,7 @@ struct RegisterRequest {
 struct RegisterResponse {
     uint32_t rank{};
     uint64_t leaseMs{};
+    uint64_t gvaBase{};
 };
 
 struct GvaRegion {

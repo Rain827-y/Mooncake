@@ -117,6 +117,7 @@ struct PreservedTentConfigOverrides {
     std::optional<bool> ascend_fabric_mem;
     std::optional<bool> ascend_standalone_single_segment;
     std::optional<bool> memfabric_store_te_init;
+    std::optional<uint64_t> memfabric_gva_reserve_base;
 };
 
 template <typename T>
@@ -258,6 +259,8 @@ PreservedTentConfigOverrides captureExplicitTransferEngineConfig(
         config, "transports/ascend_direct/standalone_single_segment", false);
     preserved.memfabric_store_te_init = captureExplicitConfigValue(
         config, "transports/memfabric/store_te_init", false);
+    preserved.memfabric_gva_reserve_base = captureExplicitConfigValue(
+        config, MEMFABRIC_GVA_RESERVE_BASE_KEY, uint64_t{0});
     return preserved;
 }
 
@@ -307,6 +310,8 @@ void restoreExplicitTransferEngineConfig(
         preserved.ascend_standalone_single_segment);
     restoreExplicitConfigValue(config, "transports/memfabric/store_te_init",
                                preserved.memfabric_store_te_init);
+    restoreExplicitConfigValue(config, MEMFABRIC_GVA_RESERVE_BASE_KEY,
+                               preserved.memfabric_gva_reserve_base);
 }
 
 TransferEngineImpl::TransferEngineImpl()
@@ -521,6 +526,19 @@ Status TransferEngineImpl::construct() {
         return Status::NotImplemented(
             "Required Fabric transport is not built or enabled" LOC_MARK);
     }
+    const bool memfabric_gva_required =
+        conf_->get(MEMFABRIC_GVA_RESERVE_BASE_KEY, uint64_t{0}) != 0;
+    if (memfabric_gva_required &&
+        (!transport_list_[MEMFABRIC] ||
+         !conf_->get("transports/memfabric/gva/enabled", false))) {
+        const auto cleanup = deconstruct();
+        if (!cleanup.ok()) {
+            LOG(ERROR) << "Failed to unwind TENT without required MemFabric GVA, error:"
+                       << cleanup.ToString() << ".";
+        }
+        return Status::NotImplemented(
+            "Required MemFabric GVA transport is not built or enabled" LOC_MARK);
+    }
 
     // A notification that arrives over the control plane - the RPC fallback
     // in sendNotification(), or a peer whose only notification path is RPC -
@@ -550,7 +568,9 @@ Status TransferEngineImpl::construct() {
                          static_cast<size_t>(TransportType::HP_TCP)) ||
                     (fabric_required &&
                      transport_index ==
-                         static_cast<size_t>(TransportType::FABRIC));
+                         static_cast<size_t>(TransportType::FABRIC)) ||
+                    (memfabric_gva_required &&
+                     transport_index == static_cast<size_t>(MEMFABRIC));
                 if (required) {
                     if (mnnvl_config_.require_fabric &&
                         transport_index == static_cast<size_t>(MNNVL)) {

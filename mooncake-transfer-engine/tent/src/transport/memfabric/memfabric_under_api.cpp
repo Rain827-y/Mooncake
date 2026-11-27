@@ -208,6 +208,9 @@ struct NativeHybm {
     if (!name##_) return false;
         HYBM_GVA_SYMBOLS(LOAD_REQUIRED)
 #undef LOAD_REQUIRED
+        // Only callers that supply a base need the fixed-address entry point.
+        hybm_reserve_mem_space_at_ = reinterpret_cast<ReserveAtFn>(
+            dlsym(library_.get(), "hybm_reserve_mem_space_at"));
         return true;
     }
     struct BatchBuffers {
@@ -226,6 +229,8 @@ struct NativeHybm {
 #define DECLARE(name) decltype(&name) name##_ = nullptr;
     HYBM_GVA_SYMBOLS(DECLARE)
 #undef DECLARE
+    using ReserveAtFn = int32_t (*)(hybm_entity_t, uint64_t, uint32_t);
+    ReserveAtFn hybm_reserve_mem_space_at_ = nullptr;
 };
 #undef HYBM_GVA_SYMBOLS
 // Publish only complete tables. Failed loads leave no state and can retry.
@@ -367,9 +372,19 @@ void* MemFabricGvaApi::create(const MemFabricGvaConfig& config) {
 void MemFabricGvaApi::destroy(void* entity) {
     if (auto* api = nativeApi()) api->hybm_destroy_entity_(entity, 0);
 }
-int MemFabricGvaApi::reserve(void* entity) {
+int MemFabricGvaApi::reserve(void* entity, uint64_t reserve_base) {
     auto* api = nativeApi();
-    return api ? api->hybm_reserve_mem_space_(entity, 0) : -1;
+    if (!api) {
+        return -1;
+    }
+    if (!reserve_base) {
+        return api->hybm_reserve_mem_space_(entity, 0);
+    }
+    if (!api->hybm_reserve_mem_space_at_) {
+        LOG(ERROR) << "HYBM library does not export hybm_reserve_mem_space_at.";
+        return -1;
+    }
+    return api->hybm_reserve_mem_space_at_(entity, reserve_base, 0);
 }
 int MemFabricGvaApi::unreserve(void* entity) {
     auto* api = nativeApi();
@@ -481,7 +496,7 @@ int MemFabricGvaApi::initialize(uint16_t) { return -1; }
 void MemFabricGvaApi::uninitialize() {}
 void* MemFabricGvaApi::create(const MemFabricGvaConfig&) { return nullptr; }
 void MemFabricGvaApi::destroy(void*) {}
-int MemFabricGvaApi::reserve(void*) { return -1; }
+int MemFabricGvaApi::reserve(void*, uint64_t) { return -1; }
 int MemFabricGvaApi::unreserve(void*) { return -1; }
 void* MemFabricGvaApi::allocate(void*, uint32_t, uint64_t) { return nullptr; }
 int MemFabricGvaApi::free(void*, void*) { return -1; }

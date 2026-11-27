@@ -273,6 +273,7 @@ Status MemFabricTransport::loadGvaConfig(const Config& conf,
     gva_config_.dram_window = dram * kGvaWindowUnit;
     gva_config_.hbm_size = gva_config_.hbm_window;
     gva_config_.dram_size = gva_config_.dram_window;
+    gva_config_.reserve_base = conf.get(MEMFABRIC_GVA_RESERVE_BASE_KEY, uint64_t{0});
     return Status::OK();
 }
 

@@ -37,6 +37,7 @@ constexpr auto DEFAULT_LEASE = Milliseconds(20000);
 constexpr auto REAP_INTERVAL = Milliseconds(1000);
 constexpr size_t DEFAULT_RPC_THREADS = 4;
 constexpr int HEARTBEAT_LOG_EVERY = 100;
+constexpr uint64_t HYBM_GLOBAL_GVM_START_ADDR = 0x340000000000UL;
 
 enum class MemberState { Pending, Registered, Joining, Joined, Leaving };
 constexpr std::array MEMBER_STATE_NAMES{"Pending", "Registered", "Joining", "Joined", "Leaving"};
@@ -422,6 +423,7 @@ Status MemoryEngineServer::Impl::Register(const RegisterRequest &request, Regist
         return Status::InvalidArgument("MemoryEngine rank layout differs from registered server layout");
     }
     response.leaseMs = static_cast<uint64_t>(mLease.count());
+    response.gvaBase = HYBM_GLOBAL_GVM_START_ADDR;
     auto found = mRegistrations.find(request.id);
     if (found != mRegistrations.end()) {
         if (found->second.expires <= Clock::now() || found->second.callback != request.callbackAddress ||

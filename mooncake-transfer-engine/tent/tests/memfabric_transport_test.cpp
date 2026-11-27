@@ -284,7 +284,7 @@ void MemFabricGvaApi::destroy(void* handle) {
     g_hybm_entities.erase(id);
 }
 
-int MemFabricGvaApi::reserve(void*) { return g_hybm->reserve_result; }
+int MemFabricGvaApi::reserve(void*, uint64_t) { return g_hybm->reserve_result; }
 int MemFabricGvaApi::unreserve(void*) { return 0; }
 
 void* MemFabricGvaApi::allocate(void* handle, uint32_t type, uint64_t bytes) {

@@ -30,6 +30,7 @@ constexpr char DEVICE_WINDOW_KEY[] = "deviceWindow";
 constexpr char CALLBACK_KEY[] = "callback";
 constexpr char RANK_KEY[] = "rank";
 constexpr char LEASE_MS_KEY[] = "leaseMs";
+constexpr char GVA_BASE_KEY[] = "gvaBase";
 constexpr char SEGMENT_KEY[] = "segment";
 constexpr char GENERATION_KEY[] = "generation";
 constexpr char REGIONS_KEY[] = "regions";
@@ -264,7 +265,7 @@ Status DecodeRegisterRequest(const json &payload, RegisterRequest &request)
 json EncodeRegisterResponse(const RegisterResponse &response, const Status &status)
 {
     if (status.ok()) {
-        return {{RANK_KEY, response.rank}, {LEASE_MS_KEY, response.leaseMs}};
+        return {{RANK_KEY, response.rank}, {LEASE_MS_KEY, response.leaseMs}, {GVA_BASE_KEY, response.gvaBase}};
     }
     // A rejected rank request can still include the lease duration.
     if (response.leaseMs) {
@@ -278,10 +279,11 @@ Status DecodeRegisterResponse(const json &payload, uint32_t worldSize, RegisterR
     try {
         const auto rank = ReadUnsigned(payload.at(RANK_KEY), worldSize - 1);
         const auto lease = ReadUnsigned(payload.at(LEASE_MS_KEY), MAX_TIMEOUT_MS);
-        if (!rank || !lease) [[unlikely]] {
+        const auto gvaBase = ReadUnsigned(payload.at(GVA_BASE_KEY), UINT64_MAX);
+        if (!rank || !lease || !gvaBase || !*gvaBase) [[unlikely]] {
             return Status::RpcServiceError("Invalid MemoryEngine registration reply");
         }
-        response = {static_cast<uint32_t>(*rank), *lease};
+        response = {static_cast<uint32_t>(*rank), *lease, *gvaBase};
         return Status::OK();
     } catch (const json::exception &) {
         return Status::MalformedJson("Malformed MemoryEngine registration reply");

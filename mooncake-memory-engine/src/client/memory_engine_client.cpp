@@ -159,8 +159,8 @@ struct MemoryEngine::Impl {
     ~Impl();
     Status Start(std::shared_ptr<const Config> config);
     Status StartCallbacks(std::string host);
-    Status Register(const std::optional<uint32_t> &requestedRank, Milliseconds heartbeat);
-    Status CreateTransferEngine(const Config &config);
+    Status Register(const std::optional<uint32_t> &requestedRank, Milliseconds heartbeat, RegisterResponse &response);
+    Status CreateTransferEngine(const Config &config, uint64_t gvaBase);
     Status InitializeRegistration();
     Status ConfirmRegistration();
     void StartHeartbeat(Milliseconds interval);
@@ -267,7 +267,8 @@ Status MemoryEngine::Impl::StartCallbacks(std::string host)
     return Status::OK();
 }
 
-Status MemoryEngine::Impl::Register(const std::optional<uint32_t> &requestedRank, Milliseconds heartbeat)
+Status MemoryEngine::Impl::Register(const std::optional<uint32_t> &requestedRank, Milliseconds heartbeat,
+                                    RegisterResponse &response)
 {
     {
         std::lock_guard lock(mPeerMutex);
@@ -284,7 +285,6 @@ Status MemoryEngine::Impl::Register(const std::optional<uint32_t> &requestedRank
                    << ", status:" << static_cast<uint16_t>(status.code()) << ".";
         return status;
     }
-    RegisterResponse response;
     const auto decodeRet = DecodeRegisterResponse(reply, mLayout.worldSize, response);
     if (!decodeRet.ok()) [[unlikely]] {
         LOG(ERROR) << "Invalid MemoryEngine Register response, registration ID:" << mId
@@ -302,10 +302,11 @@ Status MemoryEngine::Impl::Register(const std::optional<uint32_t> &requestedRank
     return Status::OK();
 }
 
-Status MemoryEngine::Impl::CreateTransferEngine(const Config &config)
+Status MemoryEngine::Impl::CreateTransferEngine(const Config &config, uint64_t gvaBase)
 {
 #ifndef USE_MEMFABRIC
     static_cast<void>(config);
+    static_cast<void>(gvaBase);
     LOG(ERROR) << "MemoryEngine requires MemFabric support, registration ID:" << mId << ", rank:" << mRank << ".";
     return Status::NotImplemented("MemoryEngine requires TENT with MemFabric support");
 #else
@@ -319,6 +320,7 @@ Status MemoryEngine::Impl::CreateTransferEngine(const Config &config)
     for (const auto &[key, value] : gva.items()) {
         native->set(std::string(TENT_GVA_CONFIG) + '/' + key, value);
     }
+    native->set(MEMFABRIC_GVA_RESERVE_BASE_KEY, gvaBase);
 
     auto tent = std::unique_ptr<TransferEngine>(new (std::nothrow) TransferEngine(native));
     if (!tent || !tent->available()) [[unlikely]] {
@@ -993,8 +995,9 @@ Status MemoryEngine::Impl::InitializeRegistration()
 
 Status MemoryEngine::Impl::ConfirmRegistration()
 {
-    CHECK_STATUS(Register(mRequestedRank, mHeartbeatInterval));
-    CHECK_STATUS(CreateTransferEngine(*mConfig));
+    RegisterResponse response;
+    CHECK_STATUS(Register(mRequestedRank, mHeartbeatInterval, response));
+    CHECK_STATUS(CreateTransferEngine(*mConfig, response.gvaBase));
     const auto status = Call(mRpc, mServer, MemoryRpc::Confirm, EncodeConfirmRequest({mId, mRank}));
     if (!status.ok()) [[unlikely]] {
         LOG(ERROR) << "MemoryEngine Confirm request failed, registration ID:" << mId << ", rank:" << mRank
