@@ -78,21 +78,14 @@ struct RemoteCopyRegion {
     SegmentID segment{};
 };
 
-struct CopyEndpoint {
-    SegmentID segment{LOCAL_SEGMENT_ID};
-    bool localGva{};
-    bool valid{true};
-};
-
-template <typename Region>
-const std::pair<const uint64_t, Region> *FindCopyRegion(const std::map<uint64_t, Region> &regions, uint64_t address)
+const RemoteCopyRegion *FindRemoteCopyRegion(const std::map<uint64_t, RemoteCopyRegion> &regions, uint64_t address)
 {
     const auto next = regions.upper_bound(address);
     if (next == regions.begin()) {
         return nullptr;
     }
     const auto range = std::prev(next);
-    return address - range->first < range->second.size ? &*range : nullptr;
+    return address - range->first < range->second.size ? &range->second : nullptr;
 }
 
 MemoryEngineCopyResult CopyResult(TransferStatusEnum status)
@@ -176,7 +169,6 @@ struct MemoryEngine::Impl {
     Status Allocate(size_t size, MemoryEngineMemType type, void **address);
     Status Free(void *address);
     Status BatchCopy(const std::vector<MemoryEngineCopyEntry> &entries, std::vector<int32_t> &results);
-    CopyEndpoint ResolveCopyEndpoint(uint64_t address, size_t size) const;
     MemoryEngineCopyResult PlanCopy(const MemoryEngineCopyEntry &entry, std::vector<Request> &requests) const;
     Status FinishCopyBatch(BatchID batch, const Status &submitted, std::vector<TransferStatus> &statuses);
     Status SharePeer(const json &payload);
@@ -455,7 +447,7 @@ Status MemoryEngine::Impl::MapPeerRegion(uint32_t rank, PeerMapping &peer, const
     }
     const auto next = mRemoteCopyRegions.lower_bound(region.address);
     if ((next != mRemoteCopyRegions.end() && next->first - region.address < region.size) ||
-        FindCopyRegion(mRemoteCopyRegions, region.address)) [[unlikely]] {
+        FindRemoteCopyRegion(mRemoteCopyRegions, region.address)) [[unlikely]] {
         LOG(ERROR) << "MemoryEngine remote region overlaps a mapped region, registration ID:" << mId
                    << ", rank:" << mRank << ", peer rank:" << rank << ", bytes:" << region.size << ".";
         return Status::InvalidEntry("MemoryEngine remote GVA routing would be ambiguous");
@@ -766,19 +758,6 @@ Status MemoryEngine::Impl::Free(void *address)
     return DrainRetired(key);
 }
 
-CopyEndpoint MemoryEngine::Impl::ResolveCopyEndpoint(uint64_t address, size_t size) const
-{
-    if (const auto *local = FindCopyRegion(mLocalRegions, address)) {
-        const auto fits = size <= local->second.size - (address - local->first);
-        return {LOCAL_SEGMENT_ID, true, fits && local->second.state == RegionState::Published};
-    }
-    if (const auto *remote = FindCopyRegion(mRemoteCopyRegions, address)) {
-        const auto fits = size <= remote->second.size - (address - remote->first);
-        return {remote->second.segment, false, fits};
-    }
-    return {};
-}
-
 MemoryEngineCopyResult MemoryEngine::Impl::PlanCopy(const MemoryEngineCopyEntry &entry,
                                                    std::vector<Request> &requests) const
 {
@@ -788,25 +767,19 @@ MemoryEngineCopyResult MemoryEngine::Impl::PlanCopy(const MemoryEngineCopyEntry 
         entry.size > UINT64_MAX - std::max(sourceAddress, targetAddress)) [[unlikely]] {
         return MemoryEngineCopyResult::InvalidArgument;
     }
-    const auto size = static_cast<size_t>(entry.size);
-    const auto source = ResolveCopyEndpoint(sourceAddress, size);
-    const auto target = ResolveCopyEndpoint(targetAddress, size);
-    if (!source.valid || !target.valid) [[unlikely]] {
-        return MemoryEngineCopyResult::InvalidArgument;
-    }
 
-    const bool write = source.localGva && target.segment != LOCAL_SEGMENT_ID;
-    const bool read = target.localGva && source.segment != LOCAL_SEGMENT_ID;
-    if (!read && !write) {
-        return MemoryEngineCopyResult::Unsupported;
-    }
+    // Use the destination segment for WRITE, or the source segment for a peer READ.
+    const auto *targetPeer = FindRemoteCopyRegion(mRemoteCopyRegions, targetAddress);
+    const auto *sourcePeer = targetPeer ? nullptr : FindRemoteCopyRegion(mRemoteCopyRegions, sourceAddress);
+    const auto *peer = targetPeer ? targetPeer : sourcePeer;
+    const bool read = sourcePeer != nullptr;
     Request request{};
-    request.opcode = write ? Request::WRITE : Request::READ;
-    request.source = write ? const_cast<void *>(entry.src) : entry.dst;
-    request.target_id = write ? target.segment : source.segment;
-    request.target_offset = write ? targetAddress : sourceAddress;
-    request.length = size;
-    request.transport_hint = MEMFABRIC;
+    request.opcode = read ? Request::READ : Request::WRITE;
+    request.source = read ? entry.dst : const_cast<void *>(entry.src);
+    request.target_id = peer ? peer->segment : LOCAL_SEGMENT_ID;
+    request.target_offset = read ? sourceAddress : targetAddress;
+    request.length = static_cast<size_t>(entry.size);
+    request.transport_hint = peer ? MEMFABRIC : UNSPEC;
     requests.push_back(request);
     return MemoryEngineCopyResult::Ok;
 }
