@@ -338,10 +338,7 @@ Status MemoryEngine::Impl::CreateTransferEngine(const Config &config, uint64_t g
             return Status::InvalidArgument("TENT configuration changed the registered GVA layout");
         }
     }
-    if (!native->get(TENT_MEMFABRIC_ENABLED, false)) [[unlikely]] {
-        LOG(ERROR) << "MemoryEngine TENT MemFabric is disabled, registration ID:" << mId << ", rank:" << mRank << ".";
-        return Status::InvalidArgument("TENT configuration disabled MemFabric");
-    }
+
     std::lock_guard lock(mPeerMutex);
     mTent = std::move(tent);
     return Status::OK();
@@ -970,7 +967,14 @@ Status MemoryEngine::Impl::Start(std::shared_ptr<const Config> config)
     mHeartbeatInterval = options.heartbeat;
     const auto &server = options.server;
     mServer = buildIpAddrWithPort(server.host, server.port, server.ipv6);
-    CHECK_STATUS(StartCallbacks(std::move(options.callbackHost)));
+
+    const bool autoDetectCallbackHost = options.callbackHost.empty();
+    const auto status = StartCallbacks(std::move(options.callbackHost));
+    if (!status.ok()) [[unlikely]] {
+        LOG(ERROR) << "Failed to start MemoryEngine callbacks, callback host mode:"
+                   << (autoDetectCallbackHost ? "auto" : "configured") << ", error:" << status.message() << ".";
+        return status;
+    }
     return InitializeRegistration();
 }
 
