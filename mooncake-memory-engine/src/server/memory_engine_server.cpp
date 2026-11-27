@@ -8,7 +8,6 @@
 #include <cstdint>
 #include <future>
 #include <iterator>
-#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -33,7 +32,7 @@ namespace mooncake {
 namespace tent {
 namespace {
 
-constexpr size_t DEFAULT_RPC_THREADS = 4;
+constexpr size_t RPC_SERVER_THREADS = 4;
 constexpr uint64_t HYBM_GLOBAL_GVM_START_ADDR = 0x340000000000UL;
 
 enum class MemberState { Pending, Registered, Joining, Joined, Leaving };
@@ -212,7 +211,7 @@ bool RegionOverlaps(const std::map<uint64_t, GvaRegion> &regions, const GvaRegio
 
 struct MemoryEngineServer::Impl {
     ~Impl();
-    Status Start(const Config &config, const Endpoint &endpoint);
+    Status Start(const Endpoint &endpoint);
     Status CheckEndpoint(const Endpoint &endpoint) const;
     Status RegisterRpcHandlers();
     Status HandleRegister(const json &payload, json &reply);
@@ -242,12 +241,10 @@ struct MemoryEngineServer::Impl {
     std::unordered_set<std::string> mUpdatingOwners;
     uint64_t mGeneration{};
     Layout mLayout;
-    Layout mConfiguredLayout;
     Endpoint mEndpoint;
     bool mLayoutConfirmed{};
     std::unordered_map<std::string, Registration> mRegistrations;
     std::set<uint32_t> mFreeRanks;
-    Milliseconds mJoinTimeout{DEFAULT_JOIN_TIMEOUT};
     MemoryEngineRpc mRpc;
 };
 
@@ -260,32 +257,12 @@ MemoryEngineServer::Impl::~Impl()
     }
 }
 
-Status MemoryEngineServer::Impl::Start(const Config &config, const Endpoint &endpoint)
+Status MemoryEngineServer::Impl::Start(const Endpoint &endpoint)
 {
-    CHECK_STATUS(ReadLayout(config, config_keys::CONFIG_SERVER_WORLD_SIZE, config_keys::CONFIG_SERVER_HOST_MEM_MAX,
-                            config_keys::CONFIG_SERVER_DEVICE_MEM_MAX, mConfiguredLayout));
-    if (!ValidWindow(mConfiguredLayout.hostWindow) || !ValidWindow(mConfiguredLayout.deviceWindow)) {
-        LOG(ERROR) << "Invalid MemoryEngine server GVA windows, host window bytes:" << mConfiguredLayout.hostWindow
-                   << ", device window bytes:" << mConfiguredLayout.deviceWindow << ".";
-        return Status::InvalidArgument("Invalid MemoryEngine server GVA windows");
-    }
-
-    mJoinTimeout = Milliseconds(config.get(config_keys::CONFIG_JOIN_TIMEOUT_MS, DEFAULT_JOIN_TIMEOUT.count()));
-    if (mJoinTimeout <= Milliseconds::zero() || mJoinTimeout >= MAX_TIMEOUT) {
-        LOG(ERROR) << "Invalid MemoryEngine server join timeout, milliseconds:" << mJoinTimeout.count() << ".";
-        return Status::InvalidArgument("Invalid MemoryEngine server join timeout");
-    }
-    const auto threads =
-        ReadUnsigned(config.get(config_keys::CONFIG_SERVER_RPC_SERVER_THREADS, json(DEFAULT_RPC_THREADS)),
-                     std::numeric_limits<size_t>::max());
-    if (!threads || !*threads) {
-        return Status::InvalidArgument("Invalid MemoryEngine server RPC thread count");
-    }
-
     CHECK_STATUS(RegisterRpcHandlers());
     auto listener = endpoint;
     CHECK_STATUS(checkLocalIpAddress(listener.host, listener.ipv6));
-    return mRpc.StartAt(listener.host, listener.port, static_cast<size_t>(*threads));
+    return mRpc.StartAt(listener.host, listener.port, RPC_SERVER_THREADS);
 }
 
 Status MemoryEngineServer::Impl::CheckEndpoint(const Endpoint &endpoint) const
@@ -377,18 +354,6 @@ Status MemoryEngineServer::Impl::Register(const RegisterRequest &request, Regist
 {
     const auto &layout = request.layout;
     std::lock_guard lock(mMutex);
-    if ((mConfiguredLayout.worldSize && mConfiguredLayout.worldSize != layout.worldSize) ||
-        (mConfiguredLayout.hostWindow && mConfiguredLayout.hostWindow != layout.hostWindow) ||
-        (mConfiguredLayout.deviceWindow && mConfiguredLayout.deviceWindow != layout.deviceWindow)) {
-        LOG(ERROR) << "MemoryEngine Register layout differs from server configuration, registration ID:" << request.id
-                   << ", client world size:" << layout.worldSize
-                   << ", server world size:" << mConfiguredLayout.worldSize
-                   << ", client host window bytes:" << layout.hostWindow
-                   << ", server host window bytes:" << mConfiguredLayout.hostWindow
-                   << ", client device window bytes:" << layout.deviceWindow
-                   << ", server device window bytes:" << mConfiguredLayout.deviceWindow << ".";
-        return Status::InvalidArgument("MemoryEngine rank layout differs from configured server layout");
-    }
     if (mLayout == Layout{}) {
         std::set<uint32_t> freeRanks;
         for (uint32_t rank = 0; rank < layout.worldSize; ++rank) {
@@ -565,7 +530,7 @@ Status MemoryEngineServer::Impl::SharePeersForJoin(const Registration &member, c
         return Status::OK();
     }
 
-    const auto deadline = Clock::now() + mJoinTimeout;
+    const auto deadline = Clock::now() + JOIN_TIMEOUT;
     std::vector<PeerCallback> calls;
     calls.reserve(peers.size());
     for (const auto &peer : peers) {
@@ -792,9 +757,8 @@ MemoryEngineServer::~MemoryEngineServer() = default;
 
 Status MemoryEngineServer::Start(const Config &config)
 {
-    const auto snapshot = config.freeze();
     Endpoint endpoint;
-    const auto parsed = ParseEndpoint(snapshot->get(config_keys::CONFIG_SERVER_URL, ""), endpoint);
+    const auto parsed = ParseEndpoint(config.get(config_keys::CONFIG_SERVER_URL, ""), endpoint);
     if (!parsed.ok()) {
         LOG(ERROR) << "Invalid MemoryEngine server endpoint, config:" << config_keys::CONFIG_SERVER_URL
                    << ", status:" << static_cast<uint16_t>(parsed.code()) << ".";
@@ -810,7 +774,7 @@ Status MemoryEngineServer::Start(const Config &config)
     if (!impl) [[unlikely]] {
         return Status::InternalError("Could not allocate MemoryEngineServer state");
     }
-    const auto status = impl->Start(*snapshot, endpoint);
+    const auto status = impl->Start(endpoint);
     if (!status.ok()) {
         LOG(ERROR) << "Failed to start MemoryEngine server, port:" << endpoint.port
                    << ", status:" << static_cast<uint16_t>(status.code()) << ".";

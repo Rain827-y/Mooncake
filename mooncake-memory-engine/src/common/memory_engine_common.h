@@ -26,10 +26,9 @@ using Clock = std::chrono::steady_clock;
 using Milliseconds = std::chrono::milliseconds;
 
 inline constexpr uint64_t GIB = 1ULL << 30;
-inline constexpr auto DEFAULT_JOIN_TIMEOUT = Milliseconds(120000);
+inline constexpr auto JOIN_TIMEOUT = Milliseconds(120000);
 inline constexpr auto RPC_TIMEOUT = Milliseconds(5000);
 inline constexpr auto RETRY_INTERVAL = Milliseconds(20);
-inline constexpr auto MAX_TIMEOUT = std::chrono::hours(24);
 inline constexpr uint64_t MAX_RANKS = std::numeric_limits<uint32_t>::max();
 
 namespace config_keys {
@@ -44,13 +43,6 @@ inline constexpr char CONFIG_DEVICE_MEM_MAX[] = "memory_engine/device_mem_max";
 inline constexpr char CONFIG_AUTO_RANKING[] = "memory_engine/auto_ranking";
 inline constexpr char CONFIG_LOCAL_RANK[] = "memory_engine/local_rank";
 inline constexpr char CONFIG_CLIENT_HOST[] = "memory_engine/client_host";
-inline constexpr char CONFIG_JOIN_TIMEOUT_MS[] = "memory_engine/join_timeout_ms";
-inline constexpr char CONFIG_BATCH_COPY_TIMEOUT_MS[] = "memory_engine/batch_copy_timeout_ms";
-
-inline constexpr char CONFIG_SERVER_WORLD_SIZE[] = "memory_engine/server/world_size";
-inline constexpr char CONFIG_SERVER_HOST_MEM_MAX[] = "memory_engine/server/host_mem_max";
-inline constexpr char CONFIG_SERVER_DEVICE_MEM_MAX[] = "memory_engine/server/device_mem_max";
-inline constexpr char CONFIG_SERVER_RPC_SERVER_THREADS[] = "memory_engine/server/rpc_server_threads";
 
 }
 

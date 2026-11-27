@@ -31,7 +31,7 @@ namespace mooncake {
 namespace tent {
 namespace {
 
-constexpr auto DEFAULT_BATCH_COPY_TIMEOUT = Milliseconds(30000);
+constexpr uint64_t BATCH_COPY_TIMEOUT_MS = 30000;
 constexpr size_t ALLOCATION_ALIGNMENT = 2UL << 20;
 constexpr int REGISTRATION_ID_WORDS = 4;
 #ifdef USE_MEMFABRIC
@@ -198,8 +198,6 @@ struct MemoryEngine::Impl {
     bool mJoinAttempted{};
     bool mJoined{};
     bool mLeaving{};
-    Milliseconds mJoinTimeout{DEFAULT_JOIN_TIMEOUT};
-    Milliseconds mBatchCopyTimeout{DEFAULT_BATCH_COPY_TIMEOUT};
     std::unordered_map<uint32_t, PeerMapping> mPeers;
     std::map<uint64_t, RemoteCopyRegion> mRemoteCopyRegions;
     std::map<uint64_t, LocalRegion> mLocalRegions;
@@ -533,7 +531,7 @@ Status MemoryEngine::Impl::Join()
     }
     const PeerCall server{mServer, EncodeJoinRequest({mId, mTent->getSegmentName()})};
     mJoinAttempted = true;
-    const auto status = CallControl(mRpc, MemoryRpc::Join, server, Clock::now() + mJoinTimeout + RPC_TIMEOUT);
+    const auto status = CallControl(mRpc, MemoryRpc::Join, server, Clock::now() + JOIN_TIMEOUT + RPC_TIMEOUT);
     if (!status.ok()) [[unlikely]] {
         LOG(ERROR) << "MemoryEngine Join request failed, registration ID:" << mId << ", rank:" << mRank
                    << ", status:" << static_cast<uint16_t>(status.code()) << ".";
@@ -590,7 +588,7 @@ Status MemoryEngine::Impl::SendRegionUpdateToServer(const GvaRegion &region, Reg
     const auto op = action == RegionUpdateAction::Publish ? MemoryRpc::PublishRegion : MemoryRpc::RevokeRegion;
     const RegionRequest request{mId, region};
     const PeerCall server{mServer, EncodeRegionRequest(request)};
-    const auto status = CallControl(mRpc, op, server, Clock::now() + mJoinTimeout + RPC_TIMEOUT);
+    const auto status = CallControl(mRpc, op, server, Clock::now() + JOIN_TIMEOUT + RPC_TIMEOUT);
     if (!status.ok()) {
         LOG(ERROR) << "MemoryEngine region update failed, registration ID:" << mId << ", rank:" << mRank
                    << ", bytes:" << request.region.size << ", status:" << static_cast<uint16_t>(status.code()) << ".";
@@ -769,7 +767,7 @@ MemoryEngineCopyResult MemoryEngine::Impl::PlanCopy(const MemoryEngineCopyEntry 
 Status MemoryEngine::Impl::FinishCopyBatch(BatchID batch, const Status &submitted,
                                           std::vector<TransferStatus> &statuses)
 {
-    auto wait = mTent->waitTransfer(batch, &statuses, static_cast<uint64_t>(mBatchCopyTimeout.count()));
+    auto wait = mTent->waitTransfer(batch, &statuses, BATCH_COPY_TIMEOUT_MS);
     const bool pending = std::any_of(statuses.begin(), statuses.end(), [](const auto &task) {
         return task.s == PENDING || task.s == INITIAL;
     });
@@ -875,7 +873,7 @@ Status MemoryEngine::Impl::ReleaseMembership()
     mLeaving = true;
     mJoined = false;
     const PeerCall server{mServer, EncodeRegistrationIdRequest({mId})};
-    const auto begin = CallControl(mRpc, MemoryRpc::BeginLeave, server, Clock::now() + mJoinTimeout);
+    const auto begin = CallControl(mRpc, MemoryRpc::BeginLeave, server, Clock::now() + JOIN_TIMEOUT);
     if (!begin.ok()) [[unlikely]] {
         LOG(ERROR) << "MemoryEngine BeginLeave failed, registration ID:" << mId << ", rank:" << mRank
                    << ", status:" << static_cast<uint16_t>(begin.code()) << ".";
@@ -910,17 +908,6 @@ Status MemoryEngine::Impl::Start(std::shared_ptr<const Config> config)
 {
     ClientOptions options;
     CHECK_STATUS(ReadClientOptions(*config, options));
-    mJoinTimeout = Milliseconds(config->get(config_keys::CONFIG_JOIN_TIMEOUT_MS, DEFAULT_JOIN_TIMEOUT.count()));
-    if (mJoinTimeout <= Milliseconds::zero() || mJoinTimeout >= MAX_TIMEOUT) {
-        LOG(ERROR) << "Invalid MemoryEngine join timeout, milliseconds:" << mJoinTimeout.count() << ".";
-        return Status::InvalidArgument("Invalid MemoryEngine join timeout");
-    }
-    mBatchCopyTimeout = Milliseconds(config->get(config_keys::CONFIG_BATCH_COPY_TIMEOUT_MS,
-                                                DEFAULT_BATCH_COPY_TIMEOUT.count()));
-    if (mBatchCopyTimeout < Milliseconds::zero() || mBatchCopyTimeout >= MAX_TIMEOUT) {
-        LOG(ERROR) << "Invalid MemoryEngine batch copy timeout, milliseconds:" << mBatchCopyTimeout.count() << ".";
-        return Status::InvalidArgument("Invalid MemoryEngine batch copy timeout");
-    }
     mConfig = std::move(config);
     mLayout = options.layout;
     mRequestedRank = options.requestedRank;
