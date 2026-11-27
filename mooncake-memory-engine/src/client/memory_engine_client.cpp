@@ -56,7 +56,7 @@ struct RemoteRegion {
 };
 
 struct PeerMapping {
-    SegmentID segment{LOCAL_SEGMENT_ID};
+    SegmentID segmentId{LOCAL_SEGMENT_ID};
     uint64_t generation{};
     bool revoked{};
     std::string segmentName;
@@ -75,7 +75,7 @@ struct LocalRegion {
 
 struct RemoteCopyRegion {
     size_t size{};
-    SegmentID segment{};
+    SegmentID segmentId{};
 };
 
 const RemoteCopyRegion *FindRemoteCopyRegion(const std::map<uint64_t, RemoteCopyRegion> &regions, uint64_t address)
@@ -174,14 +174,14 @@ struct MemoryEngine::Impl {
     Status SharePeer(const json &payload);
     Status SharePeers(const json &payload);
     Status UnsharePeer(const json &payload);
-    Status OpenSharedPeer(const std::string &id, uint32_t rank, uint64_t generation, const std::string &segment);
+    Status OpenSharedPeer(const std::string &id, uint32_t rank, uint64_t generation, const std::string &segmentName);
     Status ValidatePeerRequest(const std::string &id, uint32_t rank) const;
     Status MapPeerRegion(uint32_t rank, PeerMapping &peer, const GvaRegion &region);
     Status UpdatePeerRegion(const json &payload, PeerRegionAction action);
     Status RevokePeerRegion(uint32_t rank, PeerMapping &peer, const GvaRegion &region);
     Status DrainPeerMappings(PeerMapping &peer);
     Status ClosePeer(PeerMapping &peer);
-    bool RemoveRemoteCopyRegion(SegmentID segment, uint64_t address);
+    bool RemoveRemoteCopyRegion(SegmentID segmentId, uint64_t address);
     Status DestroyTent();
     Status AllocateLocal(size_t size, MemoryEngineMemType type, GvaRegion &region);
     Status SendRegionUpdateToServer(const GvaRegion &region, RegionUpdateAction action);
@@ -359,7 +359,7 @@ Status MemoryEngine::Impl::DrainPeerMappings(PeerMapping &peer)
 {
     Status result;
     for (const auto &[address, region] : peer.regions) {
-        const auto status = mTent->unmapRemoteMemory(peer.segment, reinterpret_cast<void *>(address), MEMFABRIC);
+        const auto status = mTent->unmapRemoteMemory(peer.segmentId, reinterpret_cast<void *>(address), MEMFABRIC);
         // MemFabric cleans the rank after its last active slice is unmapped.
         if (status.ok()) {
             result = status;
@@ -377,26 +377,26 @@ Status MemoryEngine::Impl::DrainPeerMappings(PeerMapping &peer)
 
 Status MemoryEngine::Impl::ClosePeer(PeerMapping &peer)
 {
-    if (peer.segment != LOCAL_SEGMENT_ID) {
+    if (peer.segmentId != LOCAL_SEGMENT_ID) {
         peer.revoked = true;
         for (const auto &entry : peer.regions) {
-            if (RemoveRemoteCopyRegion(peer.segment, entry.first)) {
+            if (RemoveRemoteCopyRegion(peer.segmentId, entry.first)) {
                 --peer.liveRegions;
             }
         }
         CHECK_STATUS(DrainPeerMappings(peer));
-        CHECK_STATUS(mTent->closeSegment(peer.segment));
-        peer.segment = LOCAL_SEGMENT_ID;
+        CHECK_STATUS(mTent->closeSegment(peer.segmentId));
+        peer.segmentId = LOCAL_SEGMENT_ID;
     }
     peer.revokedRegions.clear();
     peer.segmentName.clear();
     return Status::OK();
 }
 
-bool MemoryEngine::Impl::RemoveRemoteCopyRegion(SegmentID segment, uint64_t address)
+bool MemoryEngine::Impl::RemoveRemoteCopyRegion(SegmentID segmentId, uint64_t address)
 {
     const auto found = mRemoteCopyRegions.find(address);
-    if (found == mRemoteCopyRegions.end() || found->second.segment != segment) {
+    if (found == mRemoteCopyRegions.end() || found->second.segmentId != segmentId) {
         return false;
     }
     mRemoteCopyRegions.erase(found);
@@ -404,10 +404,10 @@ bool MemoryEngine::Impl::RemoveRemoteCopyRegion(SegmentID segment, uint64_t addr
 }
 
 Status MemoryEngine::Impl::OpenSharedPeer(const std::string &id, uint32_t rank, uint64_t generation,
-                                         const std::string &segment)
+                                         const std::string &segmentName)
 {
     CHECK_STATUS(ValidatePeerRequest(id, rank));
-    if (!mTent || segment == mTent->getSegmentName()) [[unlikely]] {
+    if (!mTent || segmentName == mTent->getSegmentName()) [[unlikely]] {
         return Status::InvalidEntry("Invalid MemoryEngine peer segment");
     }
     auto &peer = mPeers[rank];
@@ -419,12 +419,12 @@ Status MemoryEngine::Impl::OpenSharedPeer(const std::string &id, uint32_t rank, 
         peer.generation = generation;
         peer.revoked = false;
     }
-    if (peer.segment != LOCAL_SEGMENT_ID) {
-        return peer.segmentName == segment ? Status::OK() :
+    if (peer.segmentId != LOCAL_SEGMENT_ID) {
+        return peer.segmentName == segmentName ? Status::OK() :
             Status::InvalidEntry("MemoryEngine peer changed its segment");
     }
-    CHECK_STATUS(mTent->openSegment(peer.segment, segment));
-    peer.segmentName = segment;
+    CHECK_STATUS(mTent->openSegment(peer.segmentId, segmentName));
+    peer.segmentName = segmentName;
     return Status::OK();
 }
 
@@ -452,7 +452,7 @@ Status MemoryEngine::Impl::MapPeerRegion(uint32_t rank, PeerMapping &peer, const
         return Status::InvalidEntry("MemoryEngine remote GVA routing would be ambiguous");
     }
     // The default transport selection refreshes metadata when the region is missing from the cache.
-    const auto status = mTent->mapRemoteMemory(peer.segment, reinterpret_cast<void *>(region.address), region.size);
+    const auto status = mTent->mapRemoteMemory(peer.segmentId, reinterpret_cast<void *>(region.address), region.size);
     if (!status.ok()) [[unlikely]] {
         LOG(ERROR) << "Failed to map MemoryEngine peer region, registration ID:" << mId << ", rank:" << mRank
                    << ", peer rank:" << rank << ", bytes:" << region.size
@@ -461,7 +461,7 @@ Status MemoryEngine::Impl::MapPeerRegion(uint32_t rank, PeerMapping &peer, const
     }
     mapped.mapped = true;
     ++peer.liveRegions;
-    mRemoteCopyRegions.emplace(region.address, RemoteCopyRegion{region.size, peer.segment});
+    mRemoteCopyRegions.emplace(region.address, RemoteCopyRegion{region.size, peer.segmentId});
     return Status::OK();
 }
 
@@ -475,7 +475,7 @@ Status MemoryEngine::Impl::RevokePeerRegion(uint32_t rank, PeerMapping &peer, co
         return Status::InvalidArgument("Conflicting MemoryEngine region size");
     }
     peer.revokedRegions.insert(region.address);
-    if (RemoveRemoteCopyRegion(peer.segment, region.address)) {
+    if (RemoveRemoteCopyRegion(peer.segmentId, region.address)) {
         --peer.liveRegions;
     }
     return peer.liveRegions ? Status::OK() : DrainPeerMappings(peer);
@@ -775,7 +775,7 @@ MemoryEngineCopyResult MemoryEngine::Impl::PlanCopy(const MemoryEngineCopyEntry 
     Request request{};
     request.opcode = read ? Request::READ : Request::WRITE;
     request.source = read ? entry.dst : const_cast<void *>(entry.src);
-    request.target_id = peer ? peer->segment : LOCAL_SEGMENT_ID;
+    request.target_id = peer ? peer->segmentId : LOCAL_SEGMENT_ID;
     request.target_offset = read ? sourceAddress : targetAddress;
     request.length = static_cast<size_t>(entry.size);
     request.transport_hint = peer ? MEMFABRIC : UNSPEC;
