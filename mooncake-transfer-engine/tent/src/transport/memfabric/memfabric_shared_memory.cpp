@@ -127,7 +127,7 @@ Status MemFabricSharedMemory::initialize() {
             EntityIds::instance().release(*id);
             return nativeError("create entity");
         }
-        const auto ret = MemFabricGvaApi::reserve(entity_);
+        const auto ret = MemFabricGvaApi::reserve(entity_, config_.reserve_base);
         if (ret) {
             destroyEntity();
             return nativeError("reserve windows", ret);

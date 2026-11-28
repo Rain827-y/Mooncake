@@ -153,6 +153,7 @@ struct MemFabricGvaConfig {
     uint32_t rank_count = 0, rank = 0;
     uint16_t device = 0, entity = 64;
     uint64_t hbm_window = 0, dram_window = 0, hbm_size = 0, dram_size = 0;
+    uint64_t reserve_base = 0;
 };
 struct MemFabricGvaCopy {
     uint64_t source, destination;
@@ -174,7 +175,7 @@ class MemFabricGvaApi {
     static void uninitialize();
     static void* create(const MemFabricGvaConfig& config);
     static void destroy(void* entity);
-    static int reserve(void* entity);
+    static int reserve(void* entity, uint64_t reserve_base);
     static int unreserve(void* entity);
     static void* allocate(void* entity, uint32_t memory_type, uint64_t size);
     static int free(void* entity, void* slice);

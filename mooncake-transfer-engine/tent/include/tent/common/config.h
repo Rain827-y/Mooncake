@@ -31,6 +31,9 @@ namespace mooncake {
 namespace tent {
 using json = nlohmann::json;
 
+inline constexpr char MEMFABRIC_GVA_RESERVE_BASE_KEY[] =
+    "transports/memfabric/gva/reserve_base";
+
 class Config {
     static const char kDelimiter = '/';
 

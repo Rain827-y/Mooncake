@@ -1,0 +1,233 @@
+// Copyright 2026 KVCache.AI
+// SPDX-License-Identifier: Apache-2.0
+
+#ifndef TENT_SRC_MEMORY_ENGINE_COMMON_H
+#define TENT_SRC_MEMORY_ENGINE_COMMON_H
+
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <future>
+#include <limits>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include <glog/logging.h>
+
+#include "tent/common/config.h"
+#include "memory_engine_rpc.h"
+
+namespace mooncake {
+namespace tent {
+
+using Clock = std::chrono::steady_clock;
+using Milliseconds = std::chrono::milliseconds;
+
+inline constexpr uint64_t GIB = 1ULL << 30;
+inline constexpr size_t JOIN_LINK_BYTES = 2UL << 20;
+inline constexpr auto JOIN_TIMEOUT = Milliseconds(120000);
+inline constexpr auto RPC_TIMEOUT = Milliseconds(5000);
+inline constexpr auto RETRY_INTERVAL = Milliseconds(20);
+inline constexpr uint64_t MAX_RANKS = std::numeric_limits<uint32_t>::max();
+
+namespace config_keys {
+
+inline constexpr char CONFIG_FILE_ENV[] = "MC_MEMORY_ENGINE_CONF";
+inline constexpr char CONFIG_SECTION[] = "memory_engine";
+inline constexpr char CONFIG_ENABLED[] = "memory_engine/enabled";
+inline constexpr char CONFIG_SERVER_URL[] = "memory_engine/server_url";
+inline constexpr char CONFIG_WORLD_SIZE[] = "memory_engine/world_size";
+inline constexpr char CONFIG_HOST_MEM_MAX[] = "memory_engine/host_mem_max";
+inline constexpr char CONFIG_DEVICE_MEM_MAX[] = "memory_engine/device_mem_max";
+inline constexpr char CONFIG_AUTO_RANKING[] = "memory_engine/auto_ranking";
+inline constexpr char CONFIG_LOCAL_RANK[] = "memory_engine/local_rank";
+inline constexpr char CONFIG_CLIENT_HOST[] = "memory_engine/client_host";
+
+}
+
+enum class MemoryRpc {
+    Register = 100,
+    Confirm,
+    Cancel = 103, // Keep existing RPC IDs stable.
+    Join,
+    UnsharePeer = 106, // 105 was SharePeer.
+    BeginLeave,
+    FinishLeave,
+    PublishRegion,
+    RevokeRegion,
+    MapRegion,
+    UnmapRegion,
+    SharePeers,
+};
+
+struct Endpoint {
+    std::string host;
+    uint16_t port{};
+    bool ipv6{};
+};
+
+struct Layout {
+    uint32_t worldSize{};
+    uint64_t hostWindow{};
+    uint64_t deviceWindow{};
+    bool operator==(const Layout &) const = default;
+};
+
+struct RegisterRequest {
+    std::string id;
+    Layout layout;
+    std::string callbackAddress;
+    std::optional<uint32_t> requestedRank;
+};
+
+struct RegisterResponse {
+    uint32_t rank{};
+    uint64_t gvaBase{};
+};
+
+struct GvaRegion {
+    uint64_t address{};
+    size_t size{};
+    bool revoking = false;
+};
+
+struct RegistrationIdRequest {
+    std::string id;
+};
+
+struct ConfirmRequest {
+    std::string id;
+    uint32_t rank{};
+};
+
+struct CancelRequest {
+    std::string id;
+    std::string callbackAddress;
+};
+
+struct JoinRequest {
+    std::string id;
+    std::string segment;
+    GvaRegion linkRegion{};
+};
+
+enum class RegionUpdateAction {
+    Publish,
+    Revoke,
+};
+
+struct RegionRequest {
+    std::string id;
+    GvaRegion region;
+};
+
+struct PeerRequest {
+    std::string id;
+    uint32_t rank{};
+    uint64_t generation{};
+};
+
+struct SharedPeer {
+    uint32_t rank{};
+    uint64_t generation{};
+    std::string segment;
+    GvaRegion linkRegion{};
+    std::vector<GvaRegion> regions;
+};
+
+struct SharePeersRequest {
+    std::string id;
+    std::vector<SharedPeer> peers;
+};
+
+enum class PeerRegionAction { Map, Unmap };
+
+struct PeerRegionRequest {
+    PeerRequest peer;
+    GvaRegion region;
+};
+
+struct PeerCall {
+    std::string endpoint;
+    json request;
+};
+
+std::optional<uint64_t> ReadUnsigned(const json &value, uint64_t max);
+Status LoadMemoryEngineConfig(Config &config);
+Status ParseEndpoint(std::string url, Endpoint &endpoint);
+bool ValidWindow(uint64_t window);
+Status ValidateLayout(const Layout &layout);
+Status ReadLayout(const json &worldSize, const json &hostWindow, const json &deviceWindow, Layout &layout);
+Status ReadLayout(const Config &config, const char *worldSizeKey, const char *hostWindowKey,
+                  const char *deviceWindowKey, Layout &layout);
+
+json EncodeRegisterRequest(const RegisterRequest &request);
+Status DecodeRegisterRequest(const json &payload, RegisterRequest &request);
+
+json EncodeRegisterResponse(const RegisterResponse &response);
+Status DecodeRegisterResponse(const json &payload, uint32_t worldSize, RegisterResponse &response);
+
+json EncodeRegistrationIdRequest(const RegistrationIdRequest &request);
+Status DecodeRegistrationIdRequest(const json &payload, RegistrationIdRequest &request);
+
+json EncodeConfirmRequest(const ConfirmRequest &request);
+Status DecodeConfirmRequest(const json &payload, ConfirmRequest &request);
+
+json EncodeCancelRequest(const CancelRequest &request);
+Status DecodeCancelRequest(const json &payload, CancelRequest &request);
+
+json EncodeJoinRequest(const JoinRequest &request);
+Status DecodeJoinRequest(const json &payload, JoinRequest &request);
+
+json EncodeRegionRequest(const RegionRequest &request);
+Status DecodeRegionRequest(const json &payload, RegionRequest &request);
+
+json EncodePeerRequest(const PeerRequest &request);
+Status DecodePeerRequest(const json &payload, PeerRequest &request);
+
+json EncodeSharePeersRequest(const SharePeersRequest &request);
+Status DecodeSharePeersRequest(const json &payload, uint32_t worldSize, SharePeersRequest &request);
+
+json EncodePeerRegionRequest(const PeerRequest &peer, const GvaRegion &region);
+Status DecodePeerRegion(const json &payload, PeerRegionRequest &request);
+
+std::string EncodeReply(const Status &status, json &response);
+
+Status Call(MemoryEngineRpc &rpc, const std::string &endpoint, MemoryRpc op, const json &request, json &response);
+Status Call(MemoryEngineRpc &rpc, const std::string &endpoint, MemoryRpc op, const json &request);
+std::future<Status> CallAsync(MemoryEngineRpc &rpc, MemoryRpc op, const PeerCall &peer, Clock::time_point deadline);
+bool Retryable(const Status &status);
+
+template <typename Handler>
+Status RegisterHandler(MemoryEngineRpc &rpc, MemoryRpc op, Handler handler, bool offload = false)
+{
+    return rpc.RegisterFunction(static_cast<int>(op), [handler](std::string_view data, std::string &output) {
+        json response = json::object();
+        Status status;
+        try {
+            status = handler(json::parse(data), response);
+        } catch (const json::exception &) {
+            LOG(ERROR) << "Malformed MemoryEngine RPC request, bytes:" << data.size() << ".";
+            status = Status::MalformedJson("Malformed MemoryEngine RPC request");
+        }
+        output = EncodeReply(status, response);
+    }, offload);
+}
+
+template <typename Request, typename Handler>
+Status RegisterRequestHandler(MemoryEngineRpc &rpc, MemoryRpc op, Status (*decode)(const json &, Request &),
+                              Handler handler, bool offload = false)
+{
+    return RegisterHandler(rpc, op, [decode, handler](const json &payload, json &) {
+        Request request;
+        CHECK_STATUS(decode(payload, request));
+        return handler(request);
+    }, offload);
+}
+
+}
+}
+
+#endif

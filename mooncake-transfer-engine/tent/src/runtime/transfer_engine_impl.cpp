@@ -117,6 +117,7 @@ struct PreservedTentConfigOverrides {
     std::optional<bool> ascend_fabric_mem;
     std::optional<bool> ascend_standalone_single_segment;
     std::optional<bool> memfabric_store_te_init;
+    std::optional<uint64_t> memfabric_gva_reserve_base;
 };
 
 template <typename T>
@@ -258,6 +259,8 @@ PreservedTentConfigOverrides captureExplicitTransferEngineConfig(
         config, "transports/ascend_direct/standalone_single_segment", false);
     preserved.memfabric_store_te_init = captureExplicitConfigValue(
         config, "transports/memfabric/store_te_init", false);
+    preserved.memfabric_gva_reserve_base = captureExplicitConfigValue(
+        config, MEMFABRIC_GVA_RESERVE_BASE_KEY, uint64_t{0});
     return preserved;
 }
 
@@ -307,6 +310,8 @@ void restoreExplicitTransferEngineConfig(
         preserved.ascend_standalone_single_segment);
     restoreExplicitConfigValue(config, "transports/memfabric/store_te_init",
                                preserved.memfabric_store_te_init);
+    restoreExplicitConfigValue(config, MEMFABRIC_GVA_RESERVE_BASE_KEY,
+                               preserved.memfabric_gva_reserve_base);
 }
 
 TransferEngineImpl::TransferEngineImpl()
