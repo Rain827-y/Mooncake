@@ -526,19 +526,6 @@ Status TransferEngineImpl::construct() {
         return Status::NotImplemented(
             "Required Fabric transport is not built or enabled" LOC_MARK);
     }
-    const bool memfabric_gva_required =
-        conf_->get(MEMFABRIC_GVA_RESERVE_BASE_KEY, uint64_t{0}) != 0;
-    if (memfabric_gva_required &&
-        (!transport_list_[MEMFABRIC] ||
-         !conf_->get("transports/memfabric/gva/enabled", false))) {
-        const auto cleanup = deconstruct();
-        if (!cleanup.ok()) {
-            LOG(ERROR) << "Failed to unwind TENT without required MemFabric GVA, error:"
-                       << cleanup.ToString() << ".";
-        }
-        return Status::NotImplemented(
-            "Required MemFabric GVA transport is not built or enabled" LOC_MARK);
-    }
 
     // A notification that arrives over the control plane - the RPC fallback
     // in sendNotification(), or a peer whose only notification path is RPC -
@@ -568,9 +555,7 @@ Status TransferEngineImpl::construct() {
                          static_cast<size_t>(TransportType::HP_TCP)) ||
                     (fabric_required &&
                      transport_index ==
-                         static_cast<size_t>(TransportType::FABRIC)) ||
-                    (memfabric_gva_required &&
-                     transport_index == static_cast<size_t>(MEMFABRIC));
+                         static_cast<size_t>(TransportType::FABRIC));
                 if (required) {
                     if (mnnvl_config_.require_fabric &&
                         transport_index == static_cast<size_t>(MNNVL)) {
