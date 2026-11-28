@@ -26,6 +26,7 @@ using Clock = std::chrono::steady_clock;
 using Milliseconds = std::chrono::milliseconds;
 
 inline constexpr uint64_t GIB = 1ULL << 30;
+inline constexpr size_t JOIN_LINK_BYTES = 2UL << 20;
 inline constexpr auto JOIN_TIMEOUT = Milliseconds(120000);
 inline constexpr auto RPC_TIMEOUT = Milliseconds(5000);
 inline constexpr auto RETRY_INTERVAL = Milliseconds(20);
@@ -51,8 +52,7 @@ enum class MemoryRpc {
     Confirm,
     Cancel = 103, // Keep existing RPC IDs stable.
     Join,
-    SharePeer,
-    UnsharePeer,
+    UnsharePeer = 106, // 105 was SharePeer.
     BeginLeave,
     FinishLeave,
     PublishRegion,
@@ -110,6 +110,7 @@ struct CancelRequest {
 struct JoinRequest {
     std::string id;
     std::string segment;
+    GvaRegion linkRegion{};
 };
 
 enum class RegionUpdateAction {
@@ -132,12 +133,8 @@ struct SharedPeer {
     uint32_t rank{};
     uint64_t generation{};
     std::string segment;
+    GvaRegion linkRegion{};
     std::vector<GvaRegion> regions;
-};
-
-struct SharePeerRequest {
-    PeerRequest peer;
-    std::string segment;
 };
 
 struct SharePeersRequest {
@@ -189,9 +186,6 @@ Status DecodeRegionRequest(const json &payload, RegionRequest &request);
 
 json EncodePeerRequest(const PeerRequest &request);
 Status DecodePeerRequest(const json &payload, PeerRequest &request);
-
-json EncodeSharePeerRequest(const SharePeerRequest &request);
-Status DecodeSharePeerRequest(const json &payload, SharePeerRequest &request);
 
 json EncodeSharePeersRequest(const SharePeersRequest &request);
 Status DecodeSharePeersRequest(const json &payload, uint32_t worldSize, SharePeersRequest &request);

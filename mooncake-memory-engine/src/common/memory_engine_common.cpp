@@ -31,6 +31,7 @@ constexpr char GVA_BASE_KEY[] = "gvaBase";
 constexpr char SEGMENT_KEY[] = "segment";
 constexpr char GENERATION_KEY[] = "generation";
 constexpr char REGIONS_KEY[] = "regions";
+constexpr char LINK_REGION_KEY[] = "linkRegion";
 constexpr char PEERS_KEY[] = "peers";
 constexpr char ADDRESS_KEY[] = "address";
 constexpr char SIZE_KEY[] = "size";
@@ -82,6 +83,21 @@ bool ReadRegion(const json &payload, GvaRegion &region)
     return true;
 }
 
+json EncodeLinkRegion(const GvaRegion &region)
+{
+    if (!region.size) {
+        return nullptr;
+    }
+    json payload = json::object();
+    EncodeRegion(region, payload);
+    return payload;
+}
+
+bool ReadLinkRegion(const json &payload, GvaRegion &region)
+{
+    return payload.is_null() || (ReadRegion(payload, region) && region.size == JOIN_LINK_BYTES);
+}
+
 Status DecodePeerRankAndGeneration(const json &payload, uint32_t &rank, uint64_t &generation)
 {
     const auto decodedRank = ReadUnsigned(payload.at(RANK_KEY), MAX_RANKS);
@@ -105,7 +121,7 @@ json EncodeSharedPeer(const SharedPeer &peer)
     }
 
     return {{RANK_KEY, peer.rank}, {GENERATION_KEY, peer.generation}, {SEGMENT_KEY, peer.segment},
-            {REGIONS_KEY, std::move(regions)}};
+            {LINK_REGION_KEY, EncodeLinkRegion(peer.linkRegion)}, {REGIONS_KEY, std::move(regions)}};
 }
 
 Status DecodeSharedPeer(const json &payload, SharedPeer &peer)
@@ -115,6 +131,9 @@ Status DecodeSharedPeer(const json &payload, SharedPeer &peer)
     const auto &regions = payload.at(REGIONS_KEY);
     if (peer.segment.empty() || !regions.is_array()) {
         return Status::InvalidArgument("Invalid MemoryEngine peer description");
+    }
+    if (!ReadLinkRegion(payload.at(LINK_REGION_KEY), peer.linkRegion) || !peer.linkRegion.size) [[unlikely]] {
+        return Status::InvalidArgument("Invalid MemoryEngine peer link region");
     }
 
     peer.regions.reserve(regions.size());
@@ -320,7 +339,8 @@ Status DecodeCancelRequest(const json &payload, CancelRequest &request)
 
 json EncodeJoinRequest(const JoinRequest &request)
 {
-    return {{ID_KEY, request.id}, {SEGMENT_KEY, request.segment}};
+    return {{ID_KEY, request.id}, {SEGMENT_KEY, request.segment},
+            {LINK_REGION_KEY, EncodeLinkRegion(request.linkRegion)}};
 }
 
 Status DecodeJoinRequest(const json &payload, JoinRequest &request)
@@ -328,6 +348,9 @@ Status DecodeJoinRequest(const json &payload, JoinRequest &request)
     JoinRequest decoded{payload.at(ID_KEY).get<std::string>(), payload.at(SEGMENT_KEY).get<std::string>()};
     if (decoded.segment.empty()) {
         return Status::InvalidArgument("Missing MemoryEngine TENT segment");
+    }
+    if (!ReadLinkRegion(payload.at(LINK_REGION_KEY), decoded.linkRegion)) [[unlikely]] {
+        return Status::InvalidArgument("Invalid MemoryEngine Join link region");
     }
     request = std::move(decoded);
     return Status::OK();
@@ -366,22 +389,6 @@ Status DecodePeerRequest(const json &payload, PeerRequest &request)
     decoded.id = id.get<std::string>();
     request = std::move(decoded);
     return Status::OK();
-}
-
-json EncodeSharePeerRequest(const SharePeerRequest &request)
-{
-    auto payload = EncodePeerRequest(request.peer);
-    payload[SEGMENT_KEY] = request.segment;
-    // Earlier peers require this field when decoding SharePeer.
-    payload[REGIONS_KEY] = json::array();
-    return payload;
-}
-
-Status DecodeSharePeerRequest(const json &payload, SharePeerRequest &request)
-{
-    CHECK_STATUS(DecodePeerRequest(payload, request.peer));
-    request.segment = payload.at(SEGMENT_KEY).get<std::string>();
-    return request.segment.empty() ? Status::InvalidArgument("Missing MemoryEngine peer segment") : Status::OK();
 }
 
 json EncodeSharePeersRequest(const SharePeersRequest &request)

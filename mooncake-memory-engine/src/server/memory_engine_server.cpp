@@ -45,6 +45,7 @@ struct Registration {
     MemberState state{MemberState::Pending};
     std::string segment{};
     uint64_t generation{};
+    GvaRegion linkRegion{};
     std::map<uint64_t, GvaRegion> regions{};
     std::unordered_set<uint64_t> revokedRegions{};
     bool leavePrepared = false;
@@ -53,7 +54,7 @@ struct Registration {
 struct PeerCallback {
     PeerCall call;
     uint32_t targetRank{};
-    uint32_t ownerRank{};
+    std::optional<uint32_t> ownerRank;
 };
 
 class Mutation {
@@ -150,7 +151,7 @@ Status SendToPeersInParallel(MemoryEngineRpc &rpc, MemoryRpc op, const std::vect
             } else if (!status.ok() && failure.ok()) {
                 const auto &peer = peers[peerIndex];
                 LOG(ERROR) << "MemoryEngine peer callback failed, target rank:" << peer.targetRank
-                           << ", owner rank:" << peer.ownerRank
+                           << ", owner rank:" << (peer.ownerRank ? std::to_string(*peer.ownerRank) : "batch")
                            << ", status:" << static_cast<uint16_t>(status.code()) << ".";
                 failure = std::move(status);
             }
@@ -164,7 +165,8 @@ Status SendToPeersInParallel(MemoryEngineRpc &rpc, MemoryRpc op, const std::vect
             const auto status = Status::TimedOut("MemoryEngine callbacks did not settle");
             const auto &peer = peers[pending.front()];
             LOG(ERROR) << "MemoryEngine peer callbacks did not settle, pending count:" << retryCount
-                       << ", first pending rank:" << peer.targetRank << ", owner rank:" << peer.ownerRank
+                       << ", first pending rank:" << peer.targetRank
+                       << ", owner rank:" << (peer.ownerRank ? std::to_string(*peer.ownerRank) : "batch")
                        << ", status:" << static_cast<uint16_t>(status.code()) << ".";
             return status;
         }
@@ -177,7 +179,7 @@ Status SendToPeersInParallel(MemoryEngineRpc &rpc, MemoryRpc op, const std::vect
 
 SharedPeer BuildSharedPeer(const Registration &target, const Registration &owner)
 {
-    SharedPeer peer{owner.rank, std::max(target.generation, owner.generation), owner.segment, {}};
+    SharedPeer peer{owner.rank, std::max(target.generation, owner.generation), owner.segment, owner.linkRegion, {}};
     peer.regions.reserve(owner.regions.size());
     for (const auto &entry : owner.regions) {
         const auto &region = entry.second;
@@ -222,8 +224,6 @@ struct MemoryEngineServer::Impl {
     Status Join(const json &payload);
     Status PrepareJoin(const JoinRequest &request, Registration &member, std::vector<Registration> &peers);
     Status SharePeersForJoin(const Registration &member, const std::vector<Registration> &peers);
-    Status SendPeersInfoToJoiner(const Registration &member, const std::vector<Registration> &peers,
-                                 Clock::time_point deadline);
     Status RollbackJoin(const Registration &member, const std::vector<Registration> &peers);
     Status BeginLeave(const std::string &id);
     Status FinishLeave(const std::string &id);
@@ -510,14 +510,18 @@ Status MemoryEngineServer::Impl::PrepareJoin(const JoinRequest &request, Registr
         return Status::OK();
     }
 
+    if (current.state == MemberState::Registered) {
+        if ((mLayout.worldSize > 1) != (request.linkRegion.size != 0)) [[unlikely]] {
+            return Status::InvalidArgument("MemoryEngine Join link region does not match the rank layout");
+        }
+        current.linkRegion = request.linkRegion;
+        current.segment = request.segment;
+        current.generation = ++mGeneration;
+    }
     for (const auto &[peerId, peer] : mRegistrations) {
         if (peerId != request.id && peer.state == MemberState::Joined) {
             peers.push_back(peer);
         }
-    }
-    if (current.state == MemberState::Registered) {
-        current.segment = request.segment;
-        current.generation = ++mGeneration;
     }
     member = current;
     current.state = MemberState::Joining;
@@ -530,55 +534,25 @@ Status MemoryEngineServer::Impl::SharePeersForJoin(const Registration &member, c
         return Status::OK();
     }
 
-    const auto deadline = Clock::now() + JOIN_TIMEOUT;
     std::vector<PeerCallback> calls;
-    calls.reserve(peers.size());
+    calls.reserve(peers.size() + 1);
+    SharePeersRequest joinerRequest{member.id, {}};
+    joinerRequest.peers.reserve(peers.size());
     for (const auto &peer : peers) {
-        const auto generation = std::max(peer.generation, member.generation);
-        auto request = EncodeSharePeerRequest({{peer.id, member.rank, generation}, member.segment});
+        auto request = EncodeSharePeersRequest({peer.id, {BuildSharedPeer(peer, member)}});
         calls.push_back({{peer.callback, std::move(request)}, peer.rank, member.rank});
+        joinerRequest.peers.push_back(BuildSharedPeer(member, peer));
     }
+    calls.push_back({{member.callback, EncodeSharePeersRequest(joinerRequest)}, member.rank, std::nullopt});
 
-    const auto status = SendToPeersInParallel(mRpc, MemoryRpc::SharePeer, calls, deadline);
+    // Both sides must start mapping before either side can wait for P2P readiness.
+    const auto status = SendToPeersInParallel(mRpc, MemoryRpc::SharePeers, calls, Clock::now() + JOIN_TIMEOUT);
     if (!status.ok()) [[unlikely]] {
-        LOG(ERROR) << "Failed to notify MemoryEngine peers of Join, registration ID:" << member.id
-                   << ", rank:" << member.rank << ", status:" << static_cast<uint16_t>(status.code()) << ".";
-        return status;
+        LOG(ERROR) << "Failed to share MemoryEngine regions during Join, registration ID:" << member.id
+                   << ", rank:" << member.rank << ", peer count:" << peers.size()
+                   << ", status:" << static_cast<uint16_t>(status.code()) << ".";
     }
-    return SendPeersInfoToJoiner(member, peers, deadline);
-}
-
-Status MemoryEngineServer::Impl::SendPeersInfoToJoiner(const Registration &member,
-                                                       const std::vector<Registration> &peers,
-                                                       Clock::time_point deadline)
-{
-    PeerCall call{member.callback, {}};
-    {
-        SharePeersRequest request{member.id, {}};
-        request.peers.reserve(peers.size());
-        for (const auto &peer : peers) {
-            request.peers.push_back(BuildSharedPeer(member, peer));
-        }
-        call.request = EncodeSharePeersRequest(request);
-    }
-
-    while (Clock::now() < deadline) {
-        const auto rpcDeadline = std::min(deadline, Clock::now() + RPC_TIMEOUT);
-        auto status = CallAsync(mRpc, MemoryRpc::SharePeers, call, rpcDeadline).get();
-        if (!Retryable(status)) {
-            if (!status.ok()) [[unlikely]] {
-                LOG(ERROR) << "Failed to share existing MemoryEngine peers with joining member, registration ID:"
-                           << member.id << ", rank:" << member.rank << ", peer count:" << peers.size()
-                           << ", status:" << static_cast<uint16_t>(status.code()) << ".";
-            }
-            return status;
-        }
-        std::this_thread::sleep_until(std::min(deadline, Clock::now() + RETRY_INTERVAL));
-    }
-
-    LOG(ERROR) << "Timed out sharing existing MemoryEngine peers with joining member, registration ID:" << member.id
-               << ", rank:" << member.rank << ", peer count:" << peers.size() << ".";
-    return Status::TimedOut("MemoryEngine callbacks did not settle");
+    return status;
 }
 
 Status MemoryEngineServer::Impl::RollbackJoin(const Registration &member, const std::vector<Registration> &peers)
@@ -597,7 +571,9 @@ Status MemoryEngineServer::Impl::RollbackJoin(const Registration &member, const 
         return status;
     }
     std::lock_guard lock(mMutex);
-    mRegistrations.at(member.id).state = MemberState::Registered;
+    auto &current = mRegistrations.at(member.id);
+    current.linkRegion = {};
+    current.state = MemberState::Registered;
     return Status::OK();
 }
 

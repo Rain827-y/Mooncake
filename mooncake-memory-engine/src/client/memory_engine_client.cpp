@@ -32,7 +32,6 @@ namespace tent {
 namespace {
 
 constexpr uint64_t BATCH_COPY_TIMEOUT_MS = 30000;
-constexpr size_t ALLOCATION_ALIGNMENT = 2UL << 20;
 constexpr int REGISTRATION_ID_WORDS = 4;
 #ifdef USE_MEMFABRIC
 constexpr char TENT_METADATA_TYPE[] = "metadata_type";
@@ -64,6 +63,7 @@ struct PeerMapping {
 };
 
 enum class RegionState { Pending, Published, Revoking, Retired };
+enum class RegionRole { User, JoinLink };
 
 struct LocalRegion {
     size_t size{};
@@ -164,19 +164,19 @@ struct MemoryEngine::Impl {
     Status BatchCopy(const std::vector<MemoryEngineCopyEntry> &entries, std::vector<int32_t> &results);
     MemoryEngineCopyResult PlanCopy(const MemoryEngineCopyEntry &entry, std::vector<Request> &requests) const;
     Status FinishCopyBatch(BatchID batch, const Status &submitted, std::vector<TransferStatus> &statuses);
-    Status SharePeer(const json &payload);
     Status SharePeers(const json &payload);
     Status UnsharePeer(const json &payload);
     Status OpenSharedPeer(const std::string &id, uint32_t rank, uint64_t generation, const std::string &segmentName);
     Status ValidatePeerRequest(const std::string &id, uint32_t rank) const;
-    Status MapPeerRegion(uint32_t rank, PeerMapping &peer, const GvaRegion &region);
+    Status MapPeerRegion(uint32_t rank, PeerMapping &peer, const GvaRegion &region,
+                         RegionRole role = RegionRole::User);
     Status UpdatePeerRegion(const json &payload, PeerRegionAction action);
     Status RevokePeerRegion(uint32_t rank, PeerMapping &peer, const GvaRegion &region);
     Status DrainPeerMappings(PeerMapping &peer);
     Status ClosePeer(PeerMapping &peer);
     bool RemoveRemoteCopyRegion(SegmentID segmentId, uint64_t address);
     Status DestroyTent();
-    Status AllocateLocal(size_t size, MemoryEngineMemType type, GvaRegion &region);
+    Status AllocateLocal(size_t size, MemoryEngineMemType type, GvaRegion &region, RegionRole role = RegionRole::User);
     Status SendRegionUpdateToServer(const GvaRegion &region, RegionUpdateAction action);
     Status ReleaseLocal(uint64_t address, LocalRegion &local, bool releaseMemory);
     Status ReconcileAllocation();
@@ -189,6 +189,7 @@ struct MemoryEngine::Impl {
     std::mutex mPeerMutex;
     std::shared_ptr<const Config> mConfig;
     Layout mLayout;
+    GvaRegion mJoinLink{};
     std::optional<uint32_t> mRequestedRank;
     uint32_t mRank{};
     std::string mServer;
@@ -222,8 +223,13 @@ MemoryEngine::Impl::~Impl()
         LOG(ERROR) << "Failed to stop MemoryEngine callback RPC, registration ID:" << mId
                    << ", status:" << static_cast<uint16_t>(stopped.code()) << ".";
     }
-    mTent.reset();
     if (!mJoinAttempted && !mLeaving) {
+        const auto cleanup = DestroyTent();
+        if (!cleanup.ok()) [[unlikely]] {
+            LOG(ERROR) << "MemoryEngine destructor could not release Join resources, registration ID:" << mId
+                       << ", rank:" << mRank << ", status:" << static_cast<uint16_t>(cleanup.code()) << ".";
+            mTent.reset();
+        }
         const auto status = CancelRegistration();
         if (!status.ok()) [[unlikely]] {
             LOG(ERROR) << "MemoryEngine Cancel RPC failed, registration ID:" << mId
@@ -237,8 +243,6 @@ Status MemoryEngine::Impl::StartCallbacks(std::string host)
     bool ipv6 = false;
     const auto resolved = host.empty() ? discoverLocalIpAddress(host, ipv6) : checkLocalIpAddress(host, ipv6);
     CHECK_STATUS(resolved);
-    CHECK_STATUS(RegisterHandler(mRpc, MemoryRpc::SharePeer,
-                                 [this](const json &request, json &) { return SharePeer(request); }, true));
     CHECK_STATUS(RegisterHandler(mRpc, MemoryRpc::SharePeers,
                                  [this](const json &request, json &) { return SharePeers(request); }, true));
     CHECK_STATUS(RegisterHandler(mRpc, MemoryRpc::UnsharePeer,
@@ -366,6 +370,7 @@ Status MemoryEngine::Impl::ClosePeer(PeerMapping &peer)
             }
         }
         CHECK_STATUS(DrainPeerMappings(peer));
+        peer.liveRegions = 0;
         CHECK_STATUS(mTent->closeSegment(peer.segmentId));
         peer.segmentId = LOCAL_SEGMENT_ID;
     }
@@ -409,7 +414,7 @@ Status MemoryEngine::Impl::OpenSharedPeer(const std::string &id, uint32_t rank, 
     return Status::OK();
 }
 
-Status MemoryEngine::Impl::MapPeerRegion(uint32_t rank, PeerMapping &peer, const GvaRegion &region)
+Status MemoryEngine::Impl::MapPeerRegion(uint32_t rank, PeerMapping &peer, const GvaRegion &region, RegionRole role)
 {
     if (peer.revokedRegions.contains(region.address)) [[unlikely]] {
         LOG(ERROR) << "MemoryEngine peer region was revoked, registration ID:" << mId
@@ -425,12 +430,14 @@ Status MemoryEngine::Impl::MapPeerRegion(uint32_t rank, PeerMapping &peer, const
     if (mapped.mapped) {
         return Status::OK();
     }
-    const auto next = mRemoteCopyRegions.lower_bound(region.address);
-    if ((next != mRemoteCopyRegions.end() && next->first - region.address < region.size) ||
-        FindRemoteCopyRegion(mRemoteCopyRegions, region.address)) [[unlikely]] {
-        LOG(ERROR) << "MemoryEngine remote region overlaps a mapped region, registration ID:" << mId
-                   << ", rank:" << mRank << ", peer rank:" << rank << ", bytes:" << region.size << ".";
-        return Status::InvalidEntry("MemoryEngine remote GVA routing would be ambiguous");
+    if (role == RegionRole::User) {
+        const auto next = mRemoteCopyRegions.lower_bound(region.address);
+        if ((next != mRemoteCopyRegions.end() && next->first - region.address < region.size) ||
+            FindRemoteCopyRegion(mRemoteCopyRegions, region.address)) [[unlikely]] {
+            LOG(ERROR) << "MemoryEngine remote region overlaps a mapped region, registration ID:" << mId
+                       << ", rank:" << mRank << ", peer rank:" << rank << ", bytes:" << region.size << ".";
+            return Status::InvalidEntry("MemoryEngine remote GVA routing would be ambiguous");
+        }
     }
     // The default transport selection refreshes metadata when the region is missing from the cache.
     const auto status = mTent->mapRemoteMemory(peer.segmentId, reinterpret_cast<void *>(region.address), region.size);
@@ -442,7 +449,9 @@ Status MemoryEngine::Impl::MapPeerRegion(uint32_t rank, PeerMapping &peer, const
     }
     mapped.mapped = true;
     ++peer.liveRegions;
-    mRemoteCopyRegions.emplace(region.address, RemoteCopyRegion{region.size, peer.segmentId});
+    if (role == RegionRole::User) {
+        mRemoteCopyRegions.emplace(region.address, RemoteCopyRegion{region.size, peer.segmentId});
+    }
     return Status::OK();
 }
 
@@ -479,14 +488,6 @@ Status MemoryEngine::Impl::UpdatePeerRegion(const json &payload, PeerRegionActio
         RevokePeerRegion(rank, found->second, request.region);
 }
 
-Status MemoryEngine::Impl::SharePeer(const json &payload)
-{
-    SharePeerRequest request;
-    CHECK_STATUS(DecodeSharePeerRequest(payload, request));
-    std::lock_guard lock(mPeerMutex);
-    return OpenSharedPeer(request.peer.id, request.peer.rank, request.peer.generation, request.segment);
-}
-
 Status MemoryEngine::Impl::SharePeers(const json &payload)
 {
     SharePeersRequest request;
@@ -495,6 +496,7 @@ Status MemoryEngine::Impl::SharePeers(const json &payload)
     for (const auto &shared : request.peers) {
         CHECK_STATUS(OpenSharedPeer(request.id, shared.rank, shared.generation, shared.segment));
         auto &peer = mPeers.at(shared.rank);
+        CHECK_STATUS(MapPeerRegion(shared.rank, peer, shared.linkRegion, RegionRole::JoinLink));
         for (const auto &region : shared.regions) {
             CHECK_STATUS(MapPeerRegion(shared.rank, peer, region));
         }
@@ -529,13 +531,17 @@ Status MemoryEngine::Impl::Join()
     if (!mTent) {
         CHECK_STATUS(InitializeRegistration());
     }
-    const PeerCall server{mServer, EncodeJoinRequest({mId, mTent->getSegmentName()})};
+    const PeerCall server{mServer, EncodeJoinRequest({mId, mTent->getSegmentName(), mJoinLink})};
     mJoinAttempted = true;
     const auto status = CallControl(mRpc, MemoryRpc::Join, server, Clock::now() + JOIN_TIMEOUT + RPC_TIMEOUT);
     if (!status.ok()) [[unlikely]] {
         LOG(ERROR) << "MemoryEngine Join request failed, registration ID:" << mId << ", rank:" << mRank
                    << ", status:" << static_cast<uint16_t>(status.code()) << ".";
         return status;
+    }
+    if (mJoinLink.size) {
+        mLocalRegions.at(mJoinLink.address).state = RegionState::Published;
+        ++mLiveRegions;
     }
     mJoined = true;
     return Status::OK();
@@ -550,10 +556,11 @@ Status MemoryEngine::Impl::Leave()
     return ReleaseMembership();
 }
 
-Status MemoryEngine::Impl::AllocateLocal(size_t size, MemoryEngineMemType type, GvaRegion &region)
+Status MemoryEngine::Impl::AllocateLocal(size_t size, MemoryEngineMemType type, GvaRegion &region, RegionRole role)
 {
     MemoryOptions options;
     options.location = type == MemoryEngineMemType::Host ? "cpu" : "npu";
+    options.internal = role == RegionRole::JoinLink;
     void *memory = nullptr;
     options.type = MEMFABRIC;
     auto status = mTent->allocateLocalMemory(&memory, size, options);
@@ -658,12 +665,18 @@ Status MemoryEngine::Impl::Allocate(size_t size, MemoryEngineMemType type, void 
                      << ", bytes:" << size << ", window bytes:" << window << ".";
         return Status::TooManyRequests("MemoryEngine allocation exceeds the rank window");
     }
-    const auto aligned = ((size - 1) / ALLOCATION_ALIGNMENT + 1) * ALLOCATION_ALIGNMENT;
+    // The rank window is a multiple of 1 GiB, so rounding stays within it.
+    const auto aligned = ((static_cast<uint64_t>(size) - 1) / GIB + 1) * GIB;
+    if (aligned > std::numeric_limits<size_t>::max()) [[unlikely]] {
+        LOG(ERROR) << "MemoryEngine aligned allocation size exceeds size_t, registration ID:" << mId
+                   << ", rank:" << mRank << ", bytes:" << aligned << ".";
+        return Status::InvalidArgument("Aligned MemoryEngine allocation does not fit size_t");
+    }
     CHECK_STATUS(ReconcileAllocation());
     CHECK_STATUS(DrainRetired());
 
     GvaRegion region;
-    CHECK_STATUS(AllocateLocal(aligned, type, region));
+    CHECK_STATUS(AllocateLocal(static_cast<size_t>(aligned), type, region));
     const auto allocated = region.address;
     const auto status = SendRegionUpdateToServer(region, RegionUpdateAction::Publish);
     auto &local = mLocalRegions.at(allocated);
@@ -726,10 +739,12 @@ Status MemoryEngine::Impl::Free(void *address)
     }
     const auto key = reinterpret_cast<uint64_t>(address);
     const auto found = mLocalRegions.find(key);
-    if (found == mLocalRegions.end() || mFailedAllocation == key) [[unlikely]] {
+    if (found == mLocalRegions.end() || mFailedAllocation == key || key == mJoinLink.address) [[unlikely]] {
+        const char *reason = found == mLocalRegions.end() ? "base not owned" :
+                             key == mJoinLink.address ? "internal link region" : "rollback pending";
         LOG(WARNING) << "MemoryEngine Free rejected an allocation, registration ID:" << mId << ", rank:" << mRank
-                     << ", reason:" << (found == mLocalRegions.end() ? "base not owned" : "rollback pending") << ".";
-        return Status::InvalidArgument("MemoryEngine requires an owned allocation base");
+                     << ", reason:" << reason << ".";
+        return Status::InvalidArgument("MemoryEngine Free requires a user allocation base");
     }
     auto &local = found->second;
     if (local.state != RegionState::Retired) {
@@ -864,6 +879,7 @@ Status MemoryEngine::Impl::DestroyTent()
     mRetired.clear();
     mFailedAllocation.reset();
     mLiveRegions = 0;
+    mJoinLink = {};
     mTent.reset();
     return Status::OK();
 }
@@ -947,6 +963,10 @@ Status MemoryEngine::Impl::ConfirmRegistration()
     RegisterResponse response;
     CHECK_STATUS(Register(mRequestedRank, response));
     CHECK_STATUS(CreateTransferEngine(*mConfig, response.gvaBase));
+    if (mLayout.worldSize > 1) {
+        const auto type = mLayout.deviceWindow ? MemoryEngineMemType::Device : MemoryEngineMemType::Host;
+        CHECK_STATUS(AllocateLocal(JOIN_LINK_BYTES, type, mJoinLink, RegionRole::JoinLink));
+    }
     const auto status = Call(mRpc, mServer, MemoryRpc::Confirm, EncodeConfirmRequest({mId, mRank}));
     if (!status.ok()) [[unlikely]] {
         LOG(ERROR) << "MemoryEngine Confirm request failed, registration ID:" << mId << ", rank:" << mRank

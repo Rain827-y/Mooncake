@@ -42,6 +42,7 @@ class MemoryEngine {
     Status Join();
     // Quiesce any direct access to GVA before leaving.
     Status Leave();
+    // Rounds the requested size up to a multiple of 1 GiB.
     Status Allocate(size_t size, MemoryEngineMemType type, void **address);
     // Stop direct access on all participants before freeing the region.
     Status Free(void *address);
